@@ -590,23 +590,20 @@ class FlashInferBackend(AttentionBackend):
         return envs.VLLM_FLASHINFER_MM_PREFIX
 
     @classmethod
-    def get_required_kv_cache_layout(cls) -> KVCacheLayoutType | None:
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...] | None:
         capability = current_platform.get_device_capability()
         if capability is not None and capability.major == 10:
-            return "HND"
+            # The trtllm-gen kernels consume head-major block interiors; the
+            # L/B nesting outside the block is immaterial to them.
+            return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
         # NVFP4 KV on consumer Blackwell (sm120/sm121, FA2 path): each K/V
         # side of the cache packs [data | scale] regions carved out of the
         # side's byte range (reshape_and_cache_nvfp4 writes the scales at
         # side_base + num_heads * block_size * data_dim;
         # nvfp4_split_data_scale reads them back with derived strides).
-        # That carve is only byte-coherent when each side's heads own one
-        # contiguous region per page, i.e. under the head-major HND layout.
-        # Under NHD the K and V head rows interleave within each token and
-        # the side-region offsets land inside the other side's data ->
-        # silent KV corruption. This hook has no dtype parameter, so read
-        # the ambient vllm config (same pattern as
-        # get_kv_connector_cache_layout); if the layout hook grows a
-        # dtype-aware signature, this decision moves into it.
+        # That carve is only byte-coherent under the head-major HND layout,
+        # so require it. This hook has no dtype parameter, so read the
+        # ambient vllm config (same pattern as get_kv_connector_cache_layout).
         if capability is not None and capability.major == 12:
             vllm_config = get_current_vllm_config_or_none()
             if (
@@ -614,8 +611,8 @@ class FlashInferBackend(AttentionBackend):
                 and vllm_config.cache_config is not None
                 and vllm_config.cache_config.cache_dtype.startswith("nvfp4")
             ):
-                return "HND"
-        return None
+                return (KVCacheLayout.LBHNC,)
+        return super().supported_kv_cache_layouts()
 
     forward_includes_kv_cache_update: bool = False
 
@@ -910,14 +907,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
 
-        if self.is_kvcache_nvfp4 and get_kv_cache_layout() != "HND":
+        if self.is_kvcache_nvfp4 and get_flashinfer_layout_string(
+            self.kv_cache_layout
+        ) != "HND":
             # The NVFP4 per-side [data | scale] carve is only byte-coherent
             # under the head-major HND layout (see
-            # FlashInferBackend.get_required_kv_cache_layout). NHD would
+            # FlashInferBackend.supported_kv_cache_layouts). NHD would
             # silently corrupt the cache, so fail at init instead.
             raise ValueError(
                 "NVFP4 KV cache requires the HND KV cache layout; resolved "
-                f"layout is {get_kv_cache_layout()!r}. Unset "
+                f"layout is {get_flashinfer_layout_string(self.kv_cache_layout)!r}. Unset "
                 "VLLM_KV_CACHE_LAYOUT or set it to 'HND'."
             )
 
@@ -1390,7 +1389,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 backend = "auto"
             self._mm_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
-                get_kv_cache_layout(),
+                get_flashinfer_layout_string(self.kv_cache_layout),
                 backend=backend,
             )
         return self._mm_prefill_wrapper
