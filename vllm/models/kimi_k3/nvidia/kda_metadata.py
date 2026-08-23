@@ -232,8 +232,14 @@ def stage_spec_decode_metadata(
 
 
 @dataclass
+class KDACheckpointMetadata:
+    checkpoint_offsets: torch.Tensor
+    state_indices: torch.Tensor
+
+
+@dataclass
 class KimiK3KDAMetadata(GDNAttentionMetadata):
-    pass
+    checkpoint: KDACheckpointMetadata | None = None
 
 
 class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
