@@ -4026,6 +4026,9 @@ class GPUModelRunner(
 
             if not sampled_ids:
                 continue
+            req_id = req_ids[req_idx]
+            req_state = self.requests[req_id]
+            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
 
             # Token-0 ('!') storm defense (bookkeeping chain): never commit a
             # garbage-logits 0 into the token history / output stream. Replace
@@ -4046,7 +4049,6 @@ class GPUModelRunner(
                 if last_real >= 0:
                     sampled_ids = [last_real if v == 0 else v for v in sampled_ids]
 
-            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
             end_idx = start_idx + num_sampled_ids
             assert end_idx <= self.max_model_len, (
                 "Sampled token IDs exceed the max model length. "
@@ -4058,8 +4060,6 @@ class GPUModelRunner(
             self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
 
-            req_id = req_ids[req_idx]
-            req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
         # Compute prompt logprobs if needed.
