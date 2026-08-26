@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM120 implementation variant for ``FLASHINFER_MLA_SPARSE_SM120``."""
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -118,16 +118,33 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        topk_indices_physical = cast(
-            torch.Tensor,
+        topk_indices_physical, sparse_topk_lens = (
             triton_convert_req_index_to_global_index(
                 attn_metadata.req_id_per_token[:num_actual_toks],
                 attn_metadata.block_table,
                 topk_indices,
                 BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
-            ),
+                return_valid_counts=True,
+            )
         )
+
+        # kpool can widen the index buffer beyond the configured index_topk.
+        # FlashInfer treats sparse_mla_top_k as the page-table capacity and
+        # sparse_mla_top_k_lens as the active prefix length for each query.
+        sparse_topk_capacity = topk_indices_physical.shape[1]
+
+        extra_kwargs: dict[str, torch.Tensor] = {}
+        empty_rows: torch.Tensor | None = None
+        if self.qk_rope_head_dim == 0:
+            # Native NoPE TRTLLM-GEN MLA requires an explicit active top-k
+            # length and rejects zero-length rows. Give empty rows a harmless
+            # dummy entry for the launch, then zero their output below.
+            empty_rows = sparse_topk_lens == 0
+            topk_indices_physical[:, 0] = topk_indices_physical[:, 0].masked_fill(
+                empty_rows, 0
+            )
+            extra_kwargs["sparse_mla_top_k_lens"] = sparse_topk_lens.clamp(min=1)
 
         output = q.new_empty(
             (num_actual_toks, self.num_heads, self.kv_lora_rank),
@@ -149,12 +166,16 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=topk_indices_physical.unsqueeze(1),
-            seq_lens=None,
-            max_seq_len=attn_metadata.topk_tokens,
+            seq_lens=sparse_topk_lens,
+            max_seq_len=sparse_topk_capacity,
             out=output.unsqueeze(1),
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
-            sparse_mla_top_k=attn_metadata.topk_tokens,
+            sparse_mla_top_k=sparse_topk_capacity,
             kv_scale_format=self.kv_scale_format,
+            **extra_kwargs,
         )
-        return out.squeeze(1), None
+        out = out.squeeze(1)
+        if empty_rows is not None:
+            out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+        return out, None
