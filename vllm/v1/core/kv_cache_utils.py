@@ -1500,12 +1500,8 @@ def _glm5_next_tensor_layout(
     ):
         return None
     inner = cast(dict[str, MLAAttentionSpec], attn_uniform.kv_cache_specs)
-    mla_names = [
-        n for n in attn_group.layer_names if inner[n].tokens_per_state == 1
-    ]
-    idx_names = [
-        n for n in attn_group.layer_names if inner[n].tokens_per_state > 1
-    ]
+    mla_names = [n for n in attn_group.layer_names if inner[n].tokens_per_state == 1]
+    idx_names = [n for n in attn_group.layer_names if inner[n].tokens_per_state > 1]
     mla_pages = {inner[n].page_size_bytes for n in mla_names}
     idx_pages = {inner[n].page_size_bytes for n in idx_names}
     if len(mla_pages) != 1 or len(idx_pages) != 1:
@@ -1570,13 +1566,65 @@ def get_kv_cache_config_from_groups(
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
-    validate_kv_cache_layout(layout, kv_cache_groups)
+    glm5_layout = _glm5_next_tensor_layout(kv_cache_groups)
+    if glm5_layout is None:
+        validate_kv_cache_layout(layout, kv_cache_groups)
+    elif not (layout.is_layer_compact and layout.is_block_compact):
+        raise ValueError(
+            "GLM-5.3-Flash kpool cache requires a layer-compact, block-compact "
+            f"KV cache layout for virtual kernel-block splitting, got {layout.name}."
+        )
     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
-    interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
 
     num_blocks = available_memory // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     size = bytes_per_block * num_blocks
+
+    if glm5_layout is not None:
+        (
+            _,
+            mamba_groups,
+            mla_names,
+            idx_names,
+            mla_page,
+            idx_page,
+            tail_names,
+            _,
+        ) = glm5_layout
+        assert not tail_names or len(tail_names) == len(idx_names)
+
+        # Give every spec a layer-compact view into one backing allocation.
+        # Mamba groups alias the MLA regions, while each kpool tail aliases its
+        # sibling indexer region. Keeping a layer's manager blocks contiguous
+        # allows the indexer to split each one into 64-entry DeepGEMM pages.
+        def tensor(layers: list[str], page_size: int, offset: int) -> KVCacheTensor:
+            return KVCacheTensor(
+                size=size,
+                layers=layers,
+                layer_stride=page_size * num_blocks,
+                block_stride=page_size,
+                offset=offset,
+            )
+
+        indexer_offset = len(mla_names) * mla_page * num_blocks
+        kv_cache_tensors = [tensor(mla_names, mla_page, 0)]
+        kv_cache_tensors.extend(
+            tensor(group.layer_names, mla_page, 0) for group in mamba_groups
+        )
+        kv_cache_tensors.append(tensor(idx_names, idx_page, indexer_offset))
+        if tail_names:
+            kv_cache_tensors.append(tensor(tail_names, idx_page, indexer_offset))
+
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+            prefix_cache_retention_interval=(
+                vllm_config.cache_config.prefix_cache_retention_interval
+            ),
+        )
+
+    interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
 
     # Groups alias from byte 0. Spec regions are laid out differently:
     #

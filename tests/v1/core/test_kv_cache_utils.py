@@ -2297,6 +2297,7 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
     the kpool-sized scratch group."""
     model_config = ModelConfig(max_model_len=8192)
     vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
 
     kv_cache_spec = _glm5_like_kv_cache_spec_with_tail()
     mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
@@ -2329,21 +2330,47 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
         vllm_config, groups, bytes_per_block * 100 + 1
     )
     assert kv_cache_config.num_blocks == 100
-    # 11 MLA slot tensors + 11 indexer tensors co-owned by their sibling tail
-    # layer: the tail adds no standalone tensors and no extra bytes.
-    assert len(kv_cache_config.kv_cache_tensors) == 22
-    idx_tensors = [
-        t for t in kv_cache_config.kv_cache_tensors if t.size == idx_page * 100
-    ]
-    assert len(idx_tensors) == 11
-    for i, tensor in enumerate(idx_tensors):
-        assert tensor.shared_by == [
-            f"layers.{4 * i + 3}.indexer",
-            f"layers.{4 * i + 3}.tail",
-        ]
-    assert sum(t.size for t in kv_cache_config.kv_cache_tensors) == (
-        bytes_per_block * 100
+    # All descriptors view one backing allocation. Indexer and tail descriptors
+    # overlap exactly, while each layer's blocks remain contiguous so the
+    # manager block can be virtually split into DeepGEMM kernel pages.
+    tensors = kv_cache_config.kv_cache_tensors
+    assert len(tensors) == 7  # MLA + 4 mamba groups + indexer + tail
+    assert all(t.size == bytes_per_block * 100 for t in tensors)
+    indexer_tensor = next(t for t in tensors if t.layers[0].endswith(".indexer"))
+    tail_tensor = next(t for t in tensors if t.layers[0].endswith(".tail"))
+    assert indexer_tensor.layers == [f"layers.{4 * i + 3}.indexer" for i in range(11)]
+    assert tail_tensor.layers == [f"layers.{4 * i + 3}.tail" for i in range(11)]
+    assert indexer_tensor.offset == tail_tensor.offset == mla_page * 11 * 100
+    assert indexer_tensor.block_stride == tail_tensor.block_stride == idx_page
+    assert indexer_tensor.layer_stride == tail_tensor.layer_stride == idx_page * 100
+
+    # Reproduce the startup path from the reported failure with a single
+    # manager block: the layer-compact descriptor can be split into contiguous
+    # 64-token kernel blocks without a block/page stride mismatch.
+    from vllm.v1.kv_cache_interface import KVCacheLayout, create_kv_cache_views
+
+    indexer_spec = cast(
+        UniformTypeKVCacheSpecs,
+        next(
+            g for g in groups if indexer_tensor.layers[0] in g.layer_names
+        ).kv_cache_spec,
+    ).kv_cache_specs[indexer_tensor.layers[0]]
+    one_block_tensor = KVCacheTensor(
+        size=idx_page * len(indexer_tensor.layers),
+        layers=indexer_tensor.layers,
+        layer_stride=idx_page,
+        block_stride=idx_page,
     )
+    raw = torch.empty(one_block_tensor.size, dtype=torch.int8)
+    views = create_kv_cache_views(
+        raw,
+        indexer_spec,
+        num_blocks=1,
+        layout=KVCacheLayout.LBNHC,
+        kv_cache_tensor=one_block_tensor,
+        kernel_block_size=64,
+    )
+    assert views[0].shape[0] == indexer_spec.block_size // 64
 
     # The layout detector surfaces the sibling names in layer order for the
     # accounting and connector paths.

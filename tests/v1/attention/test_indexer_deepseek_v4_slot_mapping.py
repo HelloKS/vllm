@@ -19,8 +19,8 @@ from vllm.v1.kv_cache_interface import KVCacheLayout, MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
 
 
-def test_kpool_backends_require_block_outermost_kv_cache_layout():
-    expected = [KVCacheLayout.BLHNC, KVCacheLayout.BLNHC]
+def test_kpool_backends_require_layer_compact_kv_cache_layout():
+    expected = [KVCacheLayout.LBNHC]
 
     assert get_supported_kv_cache_layouts([KpoolIndexerBackend]) == expected
     assert get_supported_kv_cache_layouts([KpoolTailBackend]) == expected

@@ -194,9 +194,9 @@ class KpoolIndexerBackend(DeepseekV32IndexerBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        # Kpool indexer pages are smaller than their co-located MLA latent
-        # pages, so the layer dimension must be inside the block dimension.
-        return (KVCacheLayout.BLHNC, KVCacheLayout.BLNHC)
+        # Kpool's large manager blocks are virtually split into contiguous
+        # DeepGEMM pages, which requires each layer's blocks to be contiguous.
+        return (KVCacheLayout.LBNHC,)
 
 
 class KpoolTailBackend(KpoolIndexerBackend):
