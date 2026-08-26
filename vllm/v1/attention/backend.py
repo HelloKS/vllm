@@ -1062,6 +1062,13 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
             return
         from vllm import _custom_ops as ops
 
+        if kv_cache_dtype == "fp8_ds_mla" and k_pe.shape[-1] == 0:
+            # The fp8_ds_mla physical entry always reserves 64 bf16 values for
+            # RoPE, including sparse NoPE models (e.g. GLM-5.3-Flash) whose
+            # logical qk_rope_head_dim is zero. Fill that reserved tail with
+            # zeros; sparse NoPE kernels consume only the 512-D NoPE query.
+            k_pe = k_pe.new_zeros((*k_pe.shape[:-1], 64))
+
         ops.concat_and_cache_mla(
             kv_c_normed,
             k_pe.squeeze(1),
