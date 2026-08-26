@@ -146,17 +146,18 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         # sparse_mla_top_k_lens as the active prefix length for each query.
         sparse_topk_capacity = topk_indices_physical.shape[1]
 
-        extra_kwargs: dict[str, torch.Tensor] = {}
+        kernel_topk_lens = sparse_topk_lens
         empty_rows: torch.Tensor | None = None
         if self.qk_rope_head_dim == 0:
-            # Native NoPE TRTLLM-GEN MLA requires an explicit active top-k
-            # length and rejects zero-length rows. Give empty rows a harmless
-            # dummy entry for the launch, then zero their output below.
+            # The padded GLM SM120 path consumes active top-k lengths through
+            # seq_lens (sparse_mla_top_k_lens is exclusive to the native
+            # qk_rope_head_dim=0 path). Give empty rows a harmless dummy entry
+            # and length for the launch, then zero their output below.
             empty_rows = sparse_topk_lens == 0
             topk_indices_physical[:, 0] = topk_indices_physical[:, 0].masked_fill(
                 empty_rows, 0
             )
-            extra_kwargs["sparse_mla_top_k_lens"] = sparse_topk_lens.clamp(min=1)
+            kernel_topk_lens = sparse_topk_lens.clamp(min=1)
 
         output = q.new_empty(
             (num_actual_toks, self.num_heads, self.kv_lora_rank),
@@ -178,14 +179,13 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=kernel_qk_rope_head_dim,
             block_tables=topk_indices_physical.unsqueeze(1),
-            seq_lens=sparse_topk_lens,
+            seq_lens=kernel_topk_lens,
             max_seq_len=sparse_topk_capacity,
             out=output.unsqueeze(1),
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
             sparse_mla_top_k=sparse_topk_capacity,
             kv_scale_format=self.kv_scale_format,
-            **extra_kwargs,
         )
         out = out.squeeze(1)
         if empty_rows is not None:

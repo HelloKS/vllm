@@ -60,11 +60,10 @@ def test_nope_forward_passes_sparse_topk_lens(monkeypatch):
     assert captured["query"].shape == (2, 1, 2, 576)
     assert torch.equal(captured["query"][:, 0, :, :512], q)
     assert torch.count_nonzero(captured["query"][..., 512:]) == 0
-    assert torch.equal(captured["seq_lens"], valid_lens)
     assert torch.equal(
-        captured["sparse_mla_top_k_lens"],
-        torch.tensor([1, 1], dtype=torch.int32),
+        captured["seq_lens"], torch.tensor([1, 1], dtype=torch.int32)
     )
+    assert "sparse_mla_top_k_lens" not in captured
     assert captured["block_tables"][1, 0, 0] == 0
     assert torch.count_nonzero(out[0] - 7) == 0
     assert torch.count_nonzero(out[1]) == 0
