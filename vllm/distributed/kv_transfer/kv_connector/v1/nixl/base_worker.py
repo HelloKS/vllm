@@ -118,7 +118,15 @@ class NixlBaseConnectorWorker:
             # NIXL regions per SSM layer = conv sub-projections + 1 SSM temporal
             # (Mamba2/GDN: 3+1=4; Mamba1: 1+1=2).
             ssm_regions_per_layer = len(self._conv_decomp.local_conv_offsets) + 1
-            num_ssm_regions = len(self.block_len_per_layer) * ssm_regions_per_layer
+            # Only regions carrying SSM state get mamba descriptors (mirrors
+            # _build_mamba_local); keep num_ssm_regions consistent with the
+            # actual mamba desc count via _mamba_region_indices.
+            n_ssm_tensors = (
+                len(self._mamba_region_indices)
+                if self._mamba_region_indices
+                else len(self.block_len_per_layer)
+            )
+            num_ssm_regions = n_ssm_tensors * ssm_regions_per_layer
 
         num_blocks = dst_num_blocks
         if block_size_ratio is not None:
@@ -1030,6 +1038,13 @@ class NixlBaseConnectorWorker:
         caches_data = []
         seen_storage_addresses: set[int] = set()
         seen_base_addresses: list[int] = []
+        # Indices of regions carrying MambaSpec (SSM) state. A mamba layer may
+        # co-own a tensor registered under another spec (e.g. KDA+MLA shares the
+        # MLA tensor); only those regions get mamba (conv+ssm) descriptors in
+        # _build_mamba_local/_build_mamba_remote. Without this filter, non-mamba
+        # regions (e.g. GLM-5.3-Flash kpool indexers) get spurious mamba descs whose
+        # ssm extent exceeds the region page -> NIXL NOT_FOUND.
+        self._mamba_region_indices: list[int] = []
 
         packed_storage = _share_storage_and_block_stride(list(xfer_buffers.values()))
 
@@ -1141,17 +1156,24 @@ class NixlBaseConnectorWorker:
 
             for base_addr, block_len, block_stride in region_specs:
                 if base_addr in seen_base_addresses:
+                    idx = seen_base_addresses.index(base_addr)
                     if is_mla_region:
                         # Dual-purpose HMA tensor: an MLA layer shares a region
                         # that a non-MLA layer registered first. MLA is not
                         # head-sharded, so the region must be flagged MLA.
-                        idx = seen_base_addresses.index(base_addr)
                         self._region_is_mla[idx] = True
+                    if (
+                        isinstance(layer_spec, MambaSpec)
+                        and idx not in self._mamba_region_indices
+                    ):
+                        self._mamba_region_indices.append(idx)
                     continue
                 seen_base_addresses.append(base_addr)
                 self.block_len_per_layer.append(block_len)
                 self.block_stride_per_layer.append(block_stride)
                 self._region_is_mla.append(is_mla_region)
+                if isinstance(layer_spec, MambaSpec):
+                    self._mamba_region_indices.append(len(seen_base_addresses) - 1)
 
             # When there's a mismatch between kbs<>bs, we rely on HMA to ensure
             # caches are either [NB, PS] or [NB*r, PS/r] where r is bs/kbs.
@@ -1297,7 +1319,16 @@ class NixlBaseConnectorWorker:
         block_arange = np.arange(num_blocks, dtype=np.uint64)
 
         parts: list[np.ndarray] = []
-        for i, base_addr in enumerate(base_addresses):
+        # Only regions carrying SSM state get mamba (conv+ssm) descriptors;
+        # other regions (e.g. GLM-5.3-Flash kpool indexers) have no mamba state and
+        # their page is too small for the ssm extent.
+        region_indices = (
+            self._mamba_region_indices
+            if self._mamba_region_indices
+            else range(len(base_addresses))
+        )
+        for i in region_indices:
+            base_addr = base_addresses[i]
             # Jump one page_size, but ssm page_size may be bigger when kernel
             # locks block size to a specific value (physical_per_logical scale).
             page_stride = self.block_len_per_layer[i] * physical_per_logical
@@ -1341,7 +1372,15 @@ class NixlBaseConnectorWorker:
         parts: list[np.ndarray] = []
         # NOTE (ZhanqiuHu): use per-layer block_lens[i], not [0], in case
         # block lengths vary across layers (e.g. MLA).
-        for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
+        # Only regions carrying SSM state (mirrors _build_mamba_local); P and D
+        # share the same region layout, so local _mamba_region_indices apply.
+        region_indices = (
+            self._mamba_region_indices
+            if self._mamba_region_indices
+            else range(len(nixl_agent_meta.kv_caches_base_addr))
+        )
+        for i in region_indices:
+            base_addr = nixl_agent_meta.kv_caches_base_addr[i]
             page_stride = nixl_agent_meta.block_lens[i] * remote_physical_per_logical
             blk_addrs = base_addr + block_arange * page_stride
             for off, sz in conv_offsets:

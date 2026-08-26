@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from collections.abc import Callable
 from functools import cache
@@ -11,12 +12,20 @@ from typing import TYPE_CHECKING, Any
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
+
+def _preload_flashinfer_comm() -> None:
+    # Bind flashinfer to the real CUDA runtime before TileLang can load its
+    # libcudart stub. FlashInfer is optional, so keep this best-effort.
+    with contextlib.suppress(Exception):
+        import flashinfer.comm  # noqa: F401
+
 if TYPE_CHECKING or current_platform.is_cuda():
     if not has_tilelang():
         raise ImportError(
             "tilelang is required for mhc but is not installed. Install it with "
             "`pip install tilelang`."
         )
+    _preload_flashinfer_comm()
     import tilelang
     import tilelang.language as T
 else:
@@ -41,6 +50,7 @@ def _ensure_tilelang_imported() -> None:
             "tilelang is required for mhc but is not installed. Install it with "
             "`pip install tilelang`."
         )
+    _preload_flashinfer_comm()
     import tilelang as tilelang_module
     import tilelang.language as tilelang_language
 
