@@ -2373,6 +2373,11 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
         kernel_block_size=64,
     )
     assert views[0].shape[0] == indexer_spec.block_size // 64
+    indexer_cache = views[0].squeeze(1)
+    states_per_shared_block = indexer_cache.shape[1]
+    assert states_per_shared_block == 64 // indexer_spec.tokens_per_state
+    deepgemm_cache = indexer_cache.view(-1, 64, indexer_cache.shape[-1])
+    assert deepgemm_cache.shape[1] == 64
 
     tail_spec = cast(
         UniformTypeKVCacheSpecs,

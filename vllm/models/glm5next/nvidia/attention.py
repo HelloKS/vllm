@@ -120,6 +120,30 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         )
         self._index_kpool = index_kpool
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # The shared MLA group may expose smaller token-granular kernel blocks
+        # (typically 64 tokens). After kpool compression that is only
+        # 64 / index_kpool states (16 for kpool=4), while DeepGEMM requires a
+        # paged-MQA block_kv of 32 or 64. Layer-compact allocation keeps
+        # adjacent kernel blocks contiguous, so combine them into the largest
+        # supported storage page without copying.
+        cache = kv_cache.squeeze(1)
+        storage_block_size = self.cache_config.block_size // self._index_kpool
+        storage_page_size = 64 if storage_block_size % 64 == 0 else 32
+        states_per_shared_block = cache.shape[1]
+        assert storage_page_size % states_per_shared_block == 0, (
+            "Glm5NextIndexerCache: shared kernel block contains "
+            f"{states_per_shared_block} pooled states, which cannot tile a "
+            f"DeepGEMM page of {storage_page_size}."
+        )
+        blocks_per_storage_page = storage_page_size // states_per_shared_block
+        assert cache.shape[0] % blocks_per_storage_page == 0
+        self.kv_cache = cache.view(
+            cache.shape[0] // blocks_per_storage_page,
+            storage_page_size,
+            cache.shape[2],
+        )
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
         from dataclasses import replace
 

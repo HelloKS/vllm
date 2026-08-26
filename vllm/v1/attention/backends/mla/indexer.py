@@ -1111,7 +1111,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 num_tokens,
                 query_start_loc,
                 seq_lens,
-                block_table,
+                indexer_block_table,
                 self.kv_cache_spec.num_states,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
