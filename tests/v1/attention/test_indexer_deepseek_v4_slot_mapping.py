@@ -11,9 +11,19 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     BuildPrefillChunkMetadataKernel,
     DeepseekV32IndexerMetadataBuilder,
+    KpoolIndexerBackend,
+    KpoolTailBackend,
 )
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
+from vllm.v1.kv_cache_interface import KVCacheLayout, MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
+
+
+def test_kpool_backends_require_block_outermost_kv_cache_layout():
+    expected = [KVCacheLayout.BLHNC, KVCacheLayout.BLNHC]
+
+    assert get_supported_kv_cache_layouts([KpoolIndexerBackend]) == expected
+    assert get_supported_kv_cache_layouts([KpoolTailBackend]) == expected
 
 
 def test_indexer_warmup_normalizes_zero_compress_ratios():

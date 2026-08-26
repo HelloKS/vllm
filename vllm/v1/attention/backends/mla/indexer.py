@@ -185,7 +185,21 @@ class DeepseekV32IndexerBackend(AttentionBackend):
         return DeepseekV32IndexerMetadataBuilder
 
 
-class KpoolTailBackend(DeepseekV32IndexerBackend):
+class KpoolIndexerBackend(DeepseekV32IndexerBackend):
+    """Indexer backend for kpool-compressed caches with mixed page sizes."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "KPOOL_INDEXER"
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # Kpool indexer pages are smaller than their co-located MLA latent
+        # pages, so the layer dimension must be inside the block dimension.
+        return (KVCacheLayout.BLHNC, KVCacheLayout.BLNHC)
+
+
+class KpoolTailBackend(KpoolIndexerBackend):
     """Storage-only backend for the GLM-5.3-Flash kpool tail cache.
 
     The tail cache holds the in-progress pool's raw K + gate score packed into
