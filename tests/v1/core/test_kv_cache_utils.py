@@ -2173,7 +2173,7 @@ def _glm5_like_kv_cache_spec(
                 num_kv_heads=1,
                 head_size=132,
                 dtype=torch.uint8,
-                compress_ratio=16,
+                tokens_per_state=16,
             )
         else:
             name = f"layers.{i}.linear_attn"
@@ -2189,14 +2189,14 @@ def _glm5_like_kv_cache_spec_with_tail(
 
     The tail's logical page (2 * kpool * 2*indexer_head_dim * bf16) must fit
     inside the indexer page it parasitizes (block_size//kpool * 132 B), which
-    is why the fixture drops the compress_ratio=16 shape used above.
+    is why the fixture drops the tokens_per_state=16 shape used above.
     """
     kv_cache_spec, _ = _glm5_like_kv_cache_spec(mamba_spec_factory)
     for i in range(3, 45, 4):
         kpool = 4
         kv_cache_spec[f"layers.{i}.indexer"] = replace(
             cast(MLAAttentionSpec, kv_cache_spec[f"layers.{i}.indexer"]),
-            compress_ratio=kpool,
+            tokens_per_state=kpool,
         )
         kv_cache_spec[f"layers.{i}.tail"] = KpoolTailSpec(
             block_size=kpool,
@@ -2694,7 +2694,7 @@ def test_get_kv_cache_capacity_after_scheduler_unwrap():
                 num_kv_heads=1,
                 head_size=132,
                 dtype=torch.uint8,
-                compress_ratio=16,
+                tokens_per_state=16,
             )
         else:
             kv_cache_spec[f"layers.{i}.linear_attn"] = new_mamba_spec()

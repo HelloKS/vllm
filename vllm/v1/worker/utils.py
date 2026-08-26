@@ -55,14 +55,14 @@ def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
 
 
 def compressed_kernel_block_size(spec: AttentionSpec) -> int:
-    """Kernel page of a compressed cache (storage_block_size != block_size),
+    """Kernel page of a compressed cache (tokens_per_state > 1),
     in storage entries.
 
     Storage blocks up to DeepGEMM paged-MQA's largest supported page are used
     natively; larger blocks are virtually split into the largest supported page
     that tiles them.
     """
-    storage = spec.storage_block_size
+    storage = spec.num_states
     max_page, min_page = max(PAGED_MQA_PAGE_SIZES), min(PAGED_MQA_PAGE_SIZES)
     if storage <= max_page:
         return storage
@@ -296,11 +296,10 @@ class AttentionGroup:
             kv_cache_spec_builder = self.kv_cache_spec
         elif (
             isinstance(self.kv_cache_spec, AttentionSpec)
-            and self.kv_cache_spec.storage_block_size != self.kv_cache_spec.block_size
+            and self.kv_cache_spec.tokens_per_state > 1
         ):
-            compress_ratio = self.kv_cache_spec.block_size // (
-                self.kv_cache_spec.storage_block_size
-            )
+            compress_ratio = self.kv_cache_spec.tokens_per_state
+            assert isinstance(compress_ratio, int)
             kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
                 compressed_kernel_block_size(self.kv_cache_spec) * compress_ratio
             )

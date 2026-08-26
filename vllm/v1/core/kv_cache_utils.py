@@ -1390,13 +1390,15 @@ def _get_kv_cache_groups_glm5_next(
     ):
         return None
     mla_specs = cast(dict[str, MLAAttentionSpec], attn_specs)
-    idx_pages = {s.page_size_bytes for s in mla_specs.values() if s.compress_ratio > 1}
+    idx_pages = {
+        s.page_size_bytes for s in mla_specs.values() if s.tokens_per_state > 1
+    }
     if not idx_pages:
         return None
 
     assert all(s.page_size_padded is None for s in mla_specs.values())
     assert len(idx_pages) == 1
-    mla_names = [n for n, s in mla_specs.items() if s.compress_ratio == 1]
+    mla_names = [n for n, s in mla_specs.items() if s.tokens_per_state == 1]
     mla_pages = {mla_specs[n].page_size_bytes for n in mla_names}
     assert len(mla_pages) == 1
     mla_page = mla_pages.pop()
@@ -1498,8 +1500,12 @@ def _glm5_next_tensor_layout(
     ):
         return None
     inner = cast(dict[str, MLAAttentionSpec], attn_uniform.kv_cache_specs)
-    mla_names = [n for n in attn_group.layer_names if inner[n].compress_ratio == 1]
-    idx_names = [n for n in attn_group.layer_names if inner[n].compress_ratio > 1]
+    mla_names = [
+        n for n in attn_group.layer_names if inner[n].tokens_per_state == 1
+    ]
+    idx_names = [
+        n for n in attn_group.layer_names if inner[n].tokens_per_state > 1
+    ]
     mla_pages = {inner[n].page_size_bytes for n in mla_names}
     idx_pages = {inner[n].page_size_bytes for n in idx_names}
     if len(mla_pages) != 1 or len(idx_pages) != 1:
@@ -1759,78 +1765,7 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
         "The compute of layers like sliding window is still saved."
     )
 
-    has_full_attention = any(
-        isinstance(spec, FullAttentionSpec) for spec in kv_cache_spec.values()
-    )
-    has_sliding_window = any(
-        isinstance(spec, SlidingWindowSpec) for spec in kv_cache_spec.values()
-    )
-    has_chunked_local_attention = any(
-        isinstance(spec, ChunkedLocalAttentionSpec) for spec in kv_cache_spec.values()
-    )
-    has_swa_mla = any(
-        isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
-    )
-
-    uniform_block_size: int | None = None
-    if has_swa_mla:
-        # For DeepseekV4, block sizes can be different for different KV cache groups.
-        # E.g., Full MLA: 256; SWA MLA: 64; C4 partial states: 4, C128 states: 8.
-        assert has_full_attention
-        any_full_spec = next(
-            iter(
-                spec
-                for spec in kv_cache_spec.values()
-                if isinstance(spec, FullAttentionSpec)
-            )
-        )
-        uniform_block_size = any_full_spec.block_size
-
-    if has_full_attention and (has_sliding_window or has_chunked_local_attention):
-        for layer_name, spec in kv_cache_spec.items():
-            if isinstance(spec, SlidingWindowMLASpec):
-                kv_cache_spec[layer_name] = MLAAttentionSpec(
-                    block_size=uniform_block_size
-                    if uniform_block_size is not None
-                    else spec.block_size,
-                    num_kv_heads=spec.num_kv_heads,
-                    head_size=spec.head_size,
-                    dtype=spec.dtype,
-                    page_size_padded=spec.page_size_padded,
-                    cache_dtype_str=spec.cache_dtype_str,
-                    alignment=spec.alignment,
-                    compress_ratio=spec.compress_ratio,
-                    model_version=spec.model_version,
-                )
-            elif isinstance(spec, SlidingWindowSpec):
-                kv_cache_spec[layer_name] = FullAttentionSpec(
-                    block_size=spec.block_size,
-                    num_kv_heads=spec.num_kv_heads,
-                    head_size=spec.head_size,
-                    head_size_v=spec.head_size_v,
-                    dtype=spec.dtype,
-                    kv_quant_mode=spec.kv_quant_mode,
-                    sliding_window=spec.sliding_window,
-                    page_size_padded=spec.page_size_padded,
-                )
-            elif isinstance(spec, ChunkedLocalAttentionSpec):
-                kv_cache_spec[layer_name] = FullAttentionSpec(
-                    block_size=spec.block_size,
-                    num_kv_heads=spec.num_kv_heads,
-                    head_size=spec.head_size,
-                    dtype=spec.dtype,
-                    attention_chunk_size=spec.attention_chunk_size,
-                    page_size_padded=spec.page_size_padded,
-                )
-
-    if not (
-        is_kv_cache_spec_uniform(kv_cache_spec)
-        or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec)
-    ):
-        raise ValueError(
-            "Hybrid KV cache manager is disabled but failed to "
-            "convert the KV cache specs to one unified type."
-        )
+    kv_cache_spec.update(_promote_local_kv_cache_specs(kv_cache_spec))
 
 
 def group_and_unify_kv_cache_specs(

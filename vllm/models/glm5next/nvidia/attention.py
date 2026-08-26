@@ -78,7 +78,7 @@ def _pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
 class Glm5NextIndexerCache(DeepseekV32IndexerCache):
     """Indexer K cache that stores kpool-compressed entries.
 
-    Setting ``compress_ratio = index_kpool`` on the kv_cache_spec makes vLLM's
+    Setting ``tokens_per_state = index_kpool`` on the kv_cache_spec makes vLLM's
     indexer metadata builder emit pool-granular ``slot_mapping`` /
     ``seq_lens`` / ``cu_seq_lens`` / ``page_table`` for free, and shrinks the
     cache allocation to ``storage_block_size = block_size // kpool``. The pool
@@ -124,16 +124,16 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         from dataclasses import replace
 
         spec = super().get_kv_cache_spec(vllm_config)
-        # compress_ratio lives on MLAAttentionSpec, but the base
+        # tokens_per_state lives on AttentionSpec, but the base
         # DeepseekV32IndexerCache.get_kv_cache_spec is typed to return the
         # KVCacheSpec base; narrow so dataclass.replace sees the field.
         assert isinstance(spec, MLAAttentionSpec)
-        spec = replace(spec, compress_ratio=self._index_kpool)
+        spec = replace(spec, tokens_per_state=self._index_kpool)
 
         # DeepGEMM paged-MQA takes block_kv in {32, 64}; the storage block
         # (= block_size // index_kpool) is virtually split into pool pages of
         # the largest such size that tiles it, so it must be a multiple of 32.
-        storage_block_size = spec.block_size // self._index_kpool
+        storage_block_size = spec.num_states
         assert (
             spec.block_size % self._index_kpool == 0 and storage_block_size % 32 == 0
         ), (
