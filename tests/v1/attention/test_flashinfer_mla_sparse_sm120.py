@@ -11,8 +11,8 @@ from vllm.v1.attention.backends.mla import flashinfer_mla_sparse_sm120 as sm120
 def test_nope_forward_passes_sparse_topk_lens(monkeypatch):
     impl = object.__new__(sm120.FlashInferMLASparseSM120Impl)
     impl.num_heads = 2
-    impl.kv_lora_rank = 8
-    impl.qk_nope_head_dim = 16
+    impl.kv_lora_rank = 512
+    impl.qk_nope_head_dim = 256
     impl.qk_rope_head_dim = 0
     impl.scale = 0.5
     impl.kv_scale_format = "arbitrary_fp32"
@@ -48,14 +48,18 @@ def test_nope_forward_passes_sparse_topk_lens(monkeypatch):
         block_size=64,
         topk_tokens=2,
     )
-    q = torch.randn(2, 2, 16, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 64, 80, dtype=torch.uint8)
+    q = torch.randn(2, 2, 512, dtype=torch.bfloat16)
+    kv_cache = torch.empty(2, 64, 656, dtype=torch.uint8)
 
     out, lse = impl.forward_mqa(q, kv_cache, metadata, layer=None)
 
     assert lse is None
     assert captured["sparse_mla_top_k"] == 4
     assert captured["max_seq_len"] == 4
+    assert captured["qk_rope_head_dim"] == 64
+    assert captured["query"].shape == (2, 1, 2, 576)
+    assert torch.equal(captured["query"][:, 0, :, :512], q)
+    assert torch.count_nonzero(captured["query"][..., 512:]) == 0
     assert torch.equal(captured["seq_lens"], valid_lens)
     assert torch.equal(
         captured["sparse_mla_top_k_lens"],

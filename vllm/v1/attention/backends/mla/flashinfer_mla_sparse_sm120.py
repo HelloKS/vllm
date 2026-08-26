@@ -115,6 +115,18 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
 
         num_actual_toks = q.shape[0]
 
+        # The SM120 v3.2/GLM kernel has one fixed physical Q/K shape:
+        # 512 latent values plus 64 RoPE values. Native NoPE GLM exposes only
+        # the logical 512-D query, while its fp8_ds_mla cache already reserves
+        # (and zero-fills) the physical 64-D RoPE tail. Mirror that zero tail on
+        # Q and select the fixed-shape kernel ABI. The added dot-product term is
+        # exactly zero, so this does not change the logical NoPE attention.
+        kernel_q = q
+        kernel_qk_rope_head_dim = self.qk_rope_head_dim
+        if self.qk_rope_head_dim == 0:
+            kernel_q = torch.nn.functional.pad(q, (0, 64))
+            kernel_qk_rope_head_dim = 64
+
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
@@ -159,12 +171,12 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         )
 
         out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
-            query=q.unsqueeze(1),
+            query=kernel_q.unsqueeze(1),
             kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
             workspace_buffer=self._workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
+            qk_rope_head_dim=kernel_qk_rope_head_dim,
             block_tables=topk_indices_physical.unsqueeze(1),
             seq_lens=sparse_topk_lens,
             max_seq_len=sparse_topk_capacity,
