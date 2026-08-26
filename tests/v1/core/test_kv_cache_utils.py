@@ -2204,6 +2204,8 @@ def _glm5_like_kv_cache_spec_with_tail(
             head_size=256,
             head_size_v=0,
             dtype=torch.bfloat16,
+            num_head_slots=2,
+            state_content_bytes=256,
             sliding_window=kpool,
         )
     return kv_cache_spec
@@ -2371,6 +2373,28 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
         kernel_block_size=64,
     )
     assert views[0].shape[0] == indexer_spec.block_size // 64
+
+    tail_spec = cast(
+        UniformTypeKVCacheSpecs,
+        next(g for g in groups if tail_tensor.layers[0] in g.layer_names).kv_cache_spec,
+    ).kv_cache_specs[tail_tensor.layers[0]]
+    one_tail_tensor = KVCacheTensor(
+        size=idx_page,
+        layers=[tail_tensor.layers[0]],
+        layer_stride=idx_page,
+        block_stride=idx_page,
+    )
+    tail_raw = torch.empty(idx_page, dtype=torch.int8)
+    tail_views = create_kv_cache_views(
+        tail_raw,
+        tail_spec,
+        num_blocks=1,
+        layout=KVCacheLayout.LBNHC,
+        kv_cache_tensor=one_tail_tensor,
+        kernel_block_size=tail_spec.block_size,
+    )
+    assert tail_views[0].shape == (1, 2, 4, 128)
+    assert tail_views[0].squeeze(1).shape == (1, 2, 4, 128)
 
     # The layout detector surfaces the sibling names in layer order for the
     # accounting and connector paths.

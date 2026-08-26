@@ -193,6 +193,12 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
             head_size=2 * self.head_dim,
             head_size_v=0,
             dtype=torch.bfloat16,
+            # Publish the physical K/score halves to the common KV-cache
+            # allocator. This produces [B, 2, kpool, head_dim] directly; the
+            # inherited bind_kv_cache only squeezes singleton head axes, so the
+            # two-slot tail remains 4-D for the kpool kernels.
+            num_head_slots=2,
+            state_content_bytes=2 * self.head_dim,
             sliding_window=self._index_kpool,
         )
 
