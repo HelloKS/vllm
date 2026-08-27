@@ -560,10 +560,11 @@ def glm_fp8ds_nope_sparse_mla(
                 HEAD_DIM=_GLM_NOPE_DIM,
                 QUANT_BLOCK=_GLM_QUANT_BLOCK,
                 num_warps=8,
-                # The 16x512 by 512x64 score tile consumes 49,152 bytes per
-                # pipeline stage. Three stages require 147,456 bytes, above
-                # SM120's 101,376-byte shared-memory limit; two use 98,304.
-                num_stages=2,
+                # Triton reports 49,152 bytes per pipeline stage for this
+                # 16x512 by 512x64 tile. Two nominal stages leave too little
+                # room for compiler-added shared allocations on SM120, whose
+                # hard limit is 101,376 bytes, so keep this launch single-stage.
+                num_stages=1,
             )
 
             stats_grid = (chunk_tokens, num_heads)
