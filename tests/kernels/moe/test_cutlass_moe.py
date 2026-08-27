@@ -131,6 +131,50 @@ def test_nvfp4_clamp_allows_shared_activation_backends(
     assert selected == expected
 
 
+@pytest.mark.parametrize(
+    ("configured_backend", "expected"),
+    [
+        ("auto", nvfp4_oracle.NvFp4MoeBackend.MARLIN),
+        (
+            "flashinfer_cutlass",
+            nvfp4_oracle.NvFp4MoeBackend.FLASHINFER_CUTLASS,
+        ),
+    ],
+)
+def test_nvfp4_glm_sm120_prefers_marlin_only_for_auto_selection(
+    monkeypatch, configured_backend: str, expected: nvfp4_oracle.NvFp4MoeBackend
+):
+    class SupportedExperts:
+        @staticmethod
+        def is_supported_config(*args, **kwargs):
+            return True, None
+
+    class Sm120Platform:
+        @staticmethod
+        def is_device_capability_family(capability: int) -> bool:
+            return capability == 120
+
+    monkeypatch.setattr(
+        nvfp4_oracle, "backend_to_kernel_cls", lambda backend: [SupportedExperts]
+    )
+    monkeypatch.setattr(nvfp4_oracle, "current_platform", Sm120Platform())
+
+    moe_config = make_dummy_moe_config(
+        num_experts=288,
+        experts_per_token=8,
+        hidden_dim=4096,
+        intermediate_size=2048,
+    )
+    moe_config.moe_backend = configured_backend
+    moe_config.swiglu_limit = 10.0
+
+    selected, _ = nvfp4_oracle.select_nvfp4_moe_backend(
+        moe_config, weight_key=None, activation_key=None
+    )
+
+    assert selected == expected
+
+
 @dataclasses.dataclass
 class MOETensors:
     a: torch.Tensor

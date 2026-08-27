@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -179,6 +180,23 @@ def _use_a16(backend: NvFp4MoeBackend, checkpoint_uses_a16: bool) -> bool:
     )
 
 
+def _prefer_marlin_for_glm_sm120(config: FusedMoEConfig) -> bool:
+    """Avoid a silent FlashInfer CUTLASS miscompute for GLM NVFP4 on SM120.
+
+    The affected kernel reports the configuration as supported but can corrupt
+    generation for GLM's exact routed-expert shape. Keep this shape guard narrow
+    so other models and explicit backend selections retain the normal oracle.
+    """
+    return (
+        current_platform.is_device_capability_family(120)
+        and config.hidden_dim == 4096
+        and config.intermediate_size == 2048
+        and config.num_logical_experts == 288
+        and config.experts_per_token == 8
+        and config.swiglu_limit == 10.0
+    )
+
+
 def select_nvfp4_moe_backend(
     config: FusedMoEConfig,
     weight_key: QuantKey | None,
@@ -219,6 +237,14 @@ def select_nvfp4_moe_backend(
         AVAILABLE_BACKENDS = [
             b for b in AVAILABLE_BACKENDS if b in NVFP4_BACKENDS_WITH_CLAMP
         ]
+
+    # FlashInfer CUTLASS currently passes its capability checks for GLM's
+    # SM120 NVFP4 MoE shape but can silently produce invalid activations. Marlin
+    # is numerically correct for this configuration, so prefer it during auto
+    # selection. An explicitly requested backend is still handled unchanged.
+    if config.moe_backend == "auto" and _prefer_marlin_for_glm_sm120(config):
+        AVAILABLE_BACKENDS.remove(NvFp4MoeBackend.MARLIN)
+        AVAILABLE_BACKENDS.insert(0, NvFp4MoeBackend.MARLIN)
 
     use_batched = config.moe_parallel_config.use_batched_activation_format
     activation_format = (
