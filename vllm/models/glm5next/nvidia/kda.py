@@ -365,7 +365,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata_raw, dict)
-        attn_metadata_narrowed = attn_metadata_raw[self.prefix]
+        attn_metadata_narrowed = attn_metadata_raw.get(self.prefix)
+        if attn_metadata_narrowed is None:
+            # CUDA graph profile/warmup dummy runs can omit mamba-family
+            # metadata. Match the shared Kimi KDA path and leave the caller's
+            # dummy output untouched; real execution always supplies metadata.
+            return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
         has_initial_state = attn_metadata_narrowed.has_initial_state
         non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
