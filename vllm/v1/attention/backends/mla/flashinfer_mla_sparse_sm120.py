@@ -243,7 +243,10 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         # evaluating history and tail as separate fixed-shape partitions and
         # merging them through their LSEs. A plain 2176 -> 2048 truncation would
         # silently drop the newest tail tokens.
-        main_indices = topk_indices_physical[:, :_SM120_GLM_TOPK]
+        # A column slice of the 2176-wide kpool buffer retains row stride 2176
+        # and is therefore not contiguous when there is more than one query.
+        # FlashInfer's FFI requires a dense [tokens, 2048] indices tensor.
+        main_indices = topk_indices_physical[:, :_SM120_GLM_TOPK].contiguous()
         if main_indices.shape[1] < _SM120_GLM_TOPK:
             main_indices = torch.nn.functional.pad(
                 main_indices, (0, _SM120_GLM_TOPK - main_indices.shape[1]), value=-1

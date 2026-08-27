@@ -77,20 +77,28 @@ def test_kpool_tail_uses_second_fixed_topk_partition(monkeypatch):
     impl.scale = 0.5
     impl.kv_scale_format = "arbitrary_fp32"
     impl.need_to_return_lse_for_decode = True
-    impl.topk_indices_buffer = torch.arange(2176, dtype=torch.int32).unsqueeze(0)
+    impl.topk_indices_buffer = torch.stack(
+        (
+            torch.arange(2176, dtype=torch.int32),
+            torch.arange(3000, 5176, dtype=torch.int32),
+        )
+    )
     impl._workspace_buffer = torch.empty(1, dtype=torch.uint8)
 
     def fake_convert(*args, **kwargs):
-        return impl.topk_indices_buffer.clone(), torch.tensor([2051], dtype=torch.int32)
+        return impl.topk_indices_buffer.clone(), torch.tensor(
+            [2051, 2050], dtype=torch.int32
+        )
 
     calls = []
 
     def fake_decode(**kwargs):
         calls.append(kwargs)
+        assert kwargs["block_tables"].is_contiguous()
         partition = len(calls)
         kwargs["out"].fill_(2 if partition == 1 else 8)
         # Partition softmax masses are 2 and 1, respectively.
-        lse = torch.tensor([[1.0 if partition == 1 else 0.0]])
+        lse = torch.full((2, 1), 1.0 if partition == 1 else 0.0)
         return kwargs["out"], lse
 
     monkeypatch.setattr(sm120, "triton_convert_req_index_to_global_index", fake_convert)
@@ -100,23 +108,23 @@ def test_kpool_tail_uses_second_fixed_topk_partition(monkeypatch):
     )
 
     metadata = SimpleNamespace(
-        req_id_per_token=torch.tensor([0], dtype=torch.int32),
-        block_table=torch.tensor([[0]], dtype=torch.int32),
+        req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=torch.tensor([[0], [1]], dtype=torch.int32),
         block_size=64,
     )
-    q = torch.randn(1, 1, 576, dtype=torch.bfloat16)
+    q = torch.randn(2, 1, 576, dtype=torch.bfloat16)
     kv_cache = torch.empty(2, 64, 656, dtype=torch.uint8)
 
     out, lse = impl.forward_mqa(q, kv_cache, metadata, layer=None)
 
     assert len(calls) == 2
-    assert calls[0]["block_tables"].shape == (1, 1, 2048)
-    assert calls[1]["block_tables"].shape == (1, 1, 2048)
-    assert calls[0]["seq_lens"].item() == 2048
-    assert calls[1]["seq_lens"].item() == 3
+    assert calls[0]["block_tables"].shape == (2, 1, 2048)
+    assert calls[1]["block_tables"].shape == (2, 1, 2048)
+    assert calls[0]["seq_lens"].tolist() == [2048, 2048]
+    assert calls[1]["seq_lens"].tolist() == [3, 2]
     assert calls[1]["block_tables"][0, 0, :3].tolist() == [2048, 2049, 2050]
     torch.testing.assert_close(out.float(), torch.full_like(out.float(), 4.0))
-    torch.testing.assert_close(lse, torch.log2(torch.tensor([[3.0]])))
+    torch.testing.assert_close(lse, torch.log2(torch.full((2, 1), 3.0)))
 
 
 def test_merge_log2_attention_partitions_matches_direct_softmax():
