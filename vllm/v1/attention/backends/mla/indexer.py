@@ -562,6 +562,7 @@ def compute_kpool_tail_slot_mapping(
     num_actual_tokens: int,
     num_reqs: int,
     kpool: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Circular tail slots: every token of request r lands in r's own block.
 
@@ -576,11 +577,14 @@ def compute_kpool_tail_slot_mapping(
     ``slot = own_block * kpool + pos % kpool`` instead, which is the layout
     the tail kernels and ``KpoolTailManager`` are designed around.
 
-    Pure torch (no Triton, no device sync): the indexer op consumes the tail
-    slot mapping on its eager break, so the returned tensor need not be the
-    persistent ``BlockTables`` buffer.
+    Pure torch (no Triton, no device sync). ``out`` allows the metadata builder
+    to refresh persistent CUDA-graph-safe storage in place.
     """
-    out = slot_mapping.clone()
+    if out is None:
+        out = slot_mapping.clone()
+    else:
+        assert out.shape == slot_mapping.shape
+        out.copy_(slot_mapping)
     if num_actual_tokens == 0:
         return out
     device = slot_mapping.device
@@ -624,6 +628,11 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         # compressed_slot_mapping) -- the tail is storage-only and exports only
         # slot_mapping, which is rebuilt per step from the group's block table.
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.slot_mapping_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.int64,
+            device=device,
+        )
 
     def build(
         self,
@@ -639,6 +648,9 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         if positions is not None:
             # Circular per-request layout; the generic kernel output collapses
             # onto tail block 0 for pos >= kpool (see compute_... docstring).
+            slot_mapping_buffer = self.slot_mapping_buffer[
+                : slot_mapping.numel()
+            ].view_as(slot_mapping)
             slot_mapping = compute_kpool_tail_slot_mapping(
                 slot_mapping,
                 common_attn_metadata.block_table_tensor,
@@ -647,6 +659,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata.num_actual_tokens,
                 common_attn_metadata.num_reqs,
                 self.kv_cache_spec.block_size,
+                out=slot_mapping_buffer,
             )
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
