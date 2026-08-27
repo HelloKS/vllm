@@ -23,6 +23,55 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 
+_SM120_GLM_TOPK = 2048
+
+
+def _normalize_lse(
+    lse: torch.Tensor,
+    num_tokens: int,
+    num_heads: int,
+) -> torch.Tensor:
+    if lse.dim() == 3:
+        if lse.shape[-1] == 1:
+            lse = lse.squeeze(-1)
+        elif lse.shape[1] == 1:
+            lse = lse.squeeze(1)
+    if lse.shape != (num_tokens, num_heads):
+        raise RuntimeError(
+            "Unexpected FlashInfer SM120 sparse MLA LSE shape: "
+            f"{tuple(lse.shape)}, expected ({num_tokens}, {num_heads})."
+        )
+    return lse
+
+
+def _merge_log2_attention_partitions(
+    first_out: torch.Tensor,
+    first_lse: torch.Tensor,
+    second_out: torch.Tensor,
+    second_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge independently normalized attention partitions.
+
+    FlashInfer's SM120 sparse MLA kernels expose LSE in log2 space. Compute
+    the merge in FP32; this is the same split-softmax identity used by the
+    kernel's internal split-K merge.
+    """
+    merged_lse = torch.logaddexp2(first_lse, second_lse)
+    finite = torch.isfinite(merged_lse)
+    safe_lse = torch.where(finite, merged_lse, torch.zeros_like(merged_lse))
+    first_weight = torch.where(
+        torch.isfinite(first_lse), torch.exp2(first_lse - safe_lse), 0.0
+    )
+    second_weight = torch.where(
+        torch.isfinite(second_lse), torch.exp2(second_lse - safe_lse), 0.0
+    )
+    merged_out = (
+        first_out.float() * first_weight.unsqueeze(-1)
+        + second_out.float() * second_weight.unsqueeze(-1)
+    ).to(first_out.dtype)
+    return merged_out, merged_lse
+
+
 def _kv_scale_format_for_model(model_type: str | None) -> str:
     if model_type is not None and model_type.startswith("glm"):
         return "arbitrary_fp32"
@@ -114,6 +163,7 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             q = torch.cat(q, dim=-1)
 
         num_actual_toks = q.shape[0]
+        runtime_num_heads = q.shape[1]
 
         # The SM120 v3.2/GLM kernel has one fixed physical Q/K shape:
         # 512 latent values plus 64 RoPE values. Native NoPE GLM exposes only
@@ -141,29 +191,6 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             )
         )
 
-        # kpool can widen the index buffer beyond the configured index_topk.
-        # FlashInfer treats sparse_mla_top_k as the page-table capacity and
-        # sparse_mla_top_k_lens as the active prefix length for each query.
-        sparse_topk_capacity = topk_indices_physical.shape[1]
-
-        kernel_topk_lens = sparse_topk_lens
-        empty_rows: torch.Tensor | None = None
-        if self.qk_rope_head_dim == 0:
-            # The padded GLM SM120 path consumes active top-k lengths through
-            # seq_lens (sparse_mla_top_k_lens is exclusive to the native
-            # qk_rope_head_dim=0 path). Give empty rows a harmless dummy entry
-            # and length for the launch, then zero their output below.
-            empty_rows = sparse_topk_lens == 0
-            topk_indices_physical[:, 0] = topk_indices_physical[:, 0].masked_fill(
-                empty_rows, 0
-            )
-            kernel_topk_lens = sparse_topk_lens.clamp(min=1)
-
-        output = q.new_empty(
-            (num_actual_toks, self.num_heads, self.kv_lora_rank),
-            dtype=q.dtype,
-        )
-
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(q.device)
 
@@ -171,23 +198,84 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             flashinfer_trtllm_batch_decode_with_kv_cache_mla,
         )
 
-        out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
-            query=kernel_q.unsqueeze(1),
-            kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
-            workspace_buffer=self._workspace_buffer,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=kernel_qk_rope_head_dim,
-            block_tables=topk_indices_physical.unsqueeze(1),
-            seq_lens=kernel_topk_lens,
-            max_seq_len=sparse_topk_capacity,
-            out=output.unsqueeze(1),
-            bmm1_scale=self.scale,
-            bmm2_scale=1.0,
-            sparse_mla_top_k=sparse_topk_capacity,
-            kv_scale_format=self.kv_scale_format,
-        )
-        out = out.squeeze(1)
-        if empty_rows is not None:
+        def run_partition(
+            indices: torch.Tensor,
+            lengths: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            empty_rows = lengths == 0
+            indices[:, 0] = indices[:, 0].masked_fill(empty_rows, 0)
+            output = q.new_empty(
+                (num_actual_toks, runtime_num_heads, self.kv_lora_rank),
+                dtype=q.dtype,
+            )
+            kernel_out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
+                query=kernel_q.unsqueeze(1),
+                kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
+                workspace_buffer=self._workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=kernel_qk_rope_head_dim,
+                block_tables=indices.unsqueeze(1),
+                seq_lens=lengths.clamp(min=1),
+                max_seq_len=_SM120_GLM_TOPK,
+                out=output.unsqueeze(1),
+                bmm1_scale=self.scale,
+                bmm2_scale=1.0,
+                sparse_mla_top_k=_SM120_GLM_TOPK,
+                return_lse=True,
+                kv_scale_format=self.kv_scale_format,
+            )
+            if not isinstance(kernel_out, tuple):
+                raise RuntimeError(
+                    "FlashInfer SM120 sparse MLA did not return LSE when requested."
+                )
+            out, lse = kernel_out
+            out = out.squeeze(1)
+            lse = _normalize_lse(lse, num_actual_toks, runtime_num_heads)
             out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
-        return out, None
+            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+            return out, lse
+
+        # GLM kpool deliberately emits index_topk history tokens plus the
+        # incomplete trailing pool (up to kpool - 1 tokens). Its 2176-column
+        # buffer is capacity padding, while the SM120 GLM kernel is compiled
+        # only for exactly 2048 columns. Preserve the original attention set by
+        # evaluating history and tail as separate fixed-shape partitions and
+        # merging them through their LSEs. A plain 2176 -> 2048 truncation would
+        # silently drop the newest tail tokens.
+        main_indices = topk_indices_physical[:, :_SM120_GLM_TOPK]
+        if main_indices.shape[1] < _SM120_GLM_TOPK:
+            main_indices = torch.nn.functional.pad(
+                main_indices, (0, _SM120_GLM_TOPK - main_indices.shape[1]), value=-1
+            )
+        main_lens = sparse_topk_lens.clamp(max=_SM120_GLM_TOPK)
+        main_out, main_lse = run_partition(main_indices, main_lens)
+
+        if topk_indices_physical.shape[1] > _SM120_GLM_TOPK:
+            tail_indices = torch.full(
+                (num_actual_toks, _SM120_GLM_TOPK),
+                -1,
+                dtype=topk_indices_physical.dtype,
+                device=topk_indices_physical.device,
+            )
+            tail_width = min(
+                topk_indices_physical.shape[1] - _SM120_GLM_TOPK,
+                _SM120_GLM_TOPK,
+            )
+            tail_indices[:, :tail_width] = topk_indices_physical[
+                :, _SM120_GLM_TOPK : _SM120_GLM_TOPK + tail_width
+            ]
+            tail_lens = (sparse_topk_lens - _SM120_GLM_TOPK).clamp(
+                min=0, max=tail_width
+            )
+            tail_out, tail_lse = run_partition(tail_indices, tail_lens)
+            out, lse = _merge_log2_attention_partitions(
+                main_out, main_lse, tail_out, tail_lse
+            )
+        else:
+            out, lse = main_out, main_lse
+
+        empty_rows = sparse_topk_lens == 0
+        out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+        lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+        return out, lse if self.need_to_return_lse_for_decode else None

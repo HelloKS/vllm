@@ -16,6 +16,7 @@ def test_nope_forward_passes_sparse_topk_lens(monkeypatch):
     impl.qk_rope_head_dim = 0
     impl.scale = 0.5
     impl.kv_scale_format = "arbitrary_fp32"
+    impl.need_to_return_lse_for_decode = False
     impl.topk_indices_buffer = torch.tensor(
         [[3, -1, -1, -1], [-1, -1, -1, -1]], dtype=torch.int32
     )
@@ -32,11 +33,10 @@ def test_nope_forward_passes_sparse_topk_lens(monkeypatch):
     def fake_decode(**kwargs):
         captured.update(kwargs)
         kwargs["out"].fill_(7)
-        return kwargs["out"]
+        lse = torch.zeros(2, 2, dtype=torch.float32)
+        return kwargs["out"], lse
 
-    monkeypatch.setattr(
-        sm120, "triton_convert_req_index_to_global_index", fake_convert
-    )
+    monkeypatch.setattr(sm120, "triton_convert_req_index_to_global_index", fake_convert)
     monkeypatch.setattr(
         "vllm.utils.flashinfer.flashinfer_trtllm_batch_decode_with_kv_cache_mla",
         fake_decode,
@@ -54,16 +54,90 @@ def test_nope_forward_passes_sparse_topk_lens(monkeypatch):
     out, lse = impl.forward_mqa(q, kv_cache, metadata, layer=None)
 
     assert lse is None
-    assert captured["sparse_mla_top_k"] == 4
-    assert captured["max_seq_len"] == 4
+    assert captured["sparse_mla_top_k"] == 2048
+    assert captured["max_seq_len"] == 2048
+    assert captured["return_lse"] is True
     assert captured["qk_rope_head_dim"] == 64
     assert captured["query"].shape == (2, 1, 2, 576)
     assert torch.equal(captured["query"][:, 0, :, :512], q)
     assert torch.count_nonzero(captured["query"][..., 512:]) == 0
-    assert torch.equal(
-        captured["seq_lens"], torch.tensor([1, 1], dtype=torch.int32)
-    )
+    assert torch.equal(captured["seq_lens"], torch.tensor([1, 1], dtype=torch.int32))
     assert "sparse_mla_top_k_lens" not in captured
     assert captured["block_tables"][1, 0, 0] == 0
     assert torch.count_nonzero(out[0] - 7) == 0
     assert torch.count_nonzero(out[1]) == 0
+
+
+def test_kpool_tail_uses_second_fixed_topk_partition(monkeypatch):
+    impl = object.__new__(sm120.FlashInferMLASparseSM120Impl)
+    impl.num_heads = 1
+    impl.kv_lora_rank = 512
+    impl.qk_nope_head_dim = 512
+    impl.qk_rope_head_dim = 64
+    impl.scale = 0.5
+    impl.kv_scale_format = "arbitrary_fp32"
+    impl.need_to_return_lse_for_decode = True
+    impl.topk_indices_buffer = torch.arange(2176, dtype=torch.int32).unsqueeze(0)
+    impl._workspace_buffer = torch.empty(1, dtype=torch.uint8)
+
+    def fake_convert(*args, **kwargs):
+        return impl.topk_indices_buffer.clone(), torch.tensor([2051], dtype=torch.int32)
+
+    calls = []
+
+    def fake_decode(**kwargs):
+        calls.append(kwargs)
+        partition = len(calls)
+        kwargs["out"].fill_(2 if partition == 1 else 8)
+        # Partition softmax masses are 2 and 1, respectively.
+        lse = torch.tensor([[1.0 if partition == 1 else 0.0]])
+        return kwargs["out"], lse
+
+    monkeypatch.setattr(sm120, "triton_convert_req_index_to_global_index", fake_convert)
+    monkeypatch.setattr(
+        "vllm.utils.flashinfer.flashinfer_trtllm_batch_decode_with_kv_cache_mla",
+        fake_decode,
+    )
+
+    metadata = SimpleNamespace(
+        req_id_per_token=torch.tensor([0], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        block_size=64,
+    )
+    q = torch.randn(1, 1, 576, dtype=torch.bfloat16)
+    kv_cache = torch.empty(2, 64, 656, dtype=torch.uint8)
+
+    out, lse = impl.forward_mqa(q, kv_cache, metadata, layer=None)
+
+    assert len(calls) == 2
+    assert calls[0]["block_tables"].shape == (1, 1, 2048)
+    assert calls[1]["block_tables"].shape == (1, 1, 2048)
+    assert calls[0]["seq_lens"].item() == 2048
+    assert calls[1]["seq_lens"].item() == 3
+    assert calls[1]["block_tables"][0, 0, :3].tolist() == [2048, 2049, 2050]
+    torch.testing.assert_close(out.float(), torch.full_like(out.float(), 4.0))
+    torch.testing.assert_close(lse, torch.log2(torch.tensor([[3.0]])))
+
+
+def test_merge_log2_attention_partitions_matches_direct_softmax():
+    logits = torch.tensor([[[1.0, 2.0, -0.5, 3.0]]], dtype=torch.float32)
+    values = torch.tensor(
+        [[[[1.0, 0.0], [0.0, 2.0], [3.0, 1.0], [-1.0, 4.0]]]],
+        dtype=torch.float32,
+    )
+    first_logits, second_logits = logits[..., :3], logits[..., 3:]
+    first_out = torch.einsum(
+        "bhn,bhnd->bhd", first_logits.softmax(-1), values[..., :3, :]
+    )
+    second_out = values[..., 3, :]
+    first_lse = torch.logsumexp(first_logits, -1) / torch.log(torch.tensor(2.0))
+    second_lse = second_logits.squeeze(-1) / torch.log(torch.tensor(2.0))
+
+    merged_out, merged_lse = sm120._merge_log2_attention_partitions(
+        first_out, first_lse, second_out, second_lse
+    )
+    expected_out = torch.einsum("bhn,bhnd->bhd", logits.softmax(-1), values)
+    expected_lse = torch.logsumexp(logits, -1) / torch.log(torch.tensor(2.0))
+
+    torch.testing.assert_close(merged_out, expected_out)
+    torch.testing.assert_close(merged_lse, expected_lse)
