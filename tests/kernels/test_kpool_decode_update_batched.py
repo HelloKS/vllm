@@ -29,6 +29,7 @@ import pytest
 import torch
 
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+    expand_pools_and_append_tail,
     kpool_compress_and_write_cache,
     kpool_decode_update_and_maybe_write_cache_batched,
 )
@@ -39,6 +40,18 @@ PAGE_SIZE = 64
 NUM_BLOCKS = 32
 ROUND_SCALE = True
 FP8_MAX = 448.0
+
+
+def test_expand_pools_rejects_positive_ids_past_completed_pool_count():
+    pool_ids = torch.tensor([[0, 1, 2, 9, -1]], dtype=torch.int64, device="cuda")
+    seq_lens = torch.tensor([10], dtype=torch.int32, device="cuda")
+
+    out = expand_pools_and_append_tail(pool_ids, seq_lens, pool_size=4)
+
+    expected = torch.tensor(
+        [[*range(8), *([-1] * 12), 8, 9, -1]], dtype=torch.int32, device="cuda"
+    )
+    torch.testing.assert_close(out, expected)
 
 
 def _make_caches():
