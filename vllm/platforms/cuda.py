@@ -441,9 +441,17 @@ class CudaPlatformBase(Platform):
         from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 
         # kpool paged-MQA indexer: the storage block (block_size /
-        # index_kpool) is virtually split into pool pages, so block_size
-        # must be a multiple of index_kpool * min(PAGED_MQA_PAGE_SIZES).
-        return index_kpool * min(PAGED_MQA_PAGE_SIZES)
+        # index_kpool) is virtually split into pool pages. DeepGEMM supports
+        # both 32- and 64-entry pages on SM10x, but its non-FP4 SM120 kernel is
+        # instantiated only for 64 entries. Advertising the generic minimum
+        # on SM120 can produce (for example) a 416-entry storage block, which
+        # falls back to a 32-entry page and fails in DeepGEMM at runtime.
+        page_sizes = PAGED_MQA_PAGE_SIZES
+        capability = cls.get_device_capability()
+        if capability is not None and capability.major == 12:
+            page_sizes = tuple(size for size in page_sizes if size == 64)
+            assert page_sizes, "SM120 kpool indexer requires a 64-entry MQA page"
+        return index_kpool * min(page_sizes)
 
     @classmethod
     def get_attn_backend_cls(

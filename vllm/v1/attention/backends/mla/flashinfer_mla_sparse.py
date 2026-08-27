@@ -160,7 +160,10 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64, 256]
+        # FlashInfer's GLM_NSA/DSV3_2 SM120 kernels are instantiated with a
+        # 64-token page only. Returning 256 lets the hybrid cache manager pick
+        # a page shape that passes allocation but has no matching kernel.
+        return [64]
 
     @staticmethod
     def get_impl_cls() -> type[MLAAttentionImpl]:
@@ -188,6 +191,7 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         device_capability: DeviceCapability,
     ) -> str | None:
         from vllm.config import get_current_vllm_config
+
         if dtype != torch.bfloat16:
             return "dtype not supported"
         if kv_cache_dtype not in (

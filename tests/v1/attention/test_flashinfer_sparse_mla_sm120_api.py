@@ -37,6 +37,10 @@ def test_sm120_backend_uses_dedicated_backend_name() -> None:
     )
 
 
+def test_sm120_backend_pins_kernel_block_size_to_64() -> None:
+    assert FlashInferMLASparseSM120Backend.get_supported_kernel_block_sizes() == [64]
+
+
 def test_sm120_backend_uses_sparse_mqa_for_prefill() -> None:
     impl_cls = FlashInferMLASparseSM120Backend.get_impl_cls()
 
