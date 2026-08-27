@@ -142,7 +142,7 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         )
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
-        if not has_flashinfer_sparse_mla_sm120():
+        if self.qk_rope_head_dim != 0 and not has_flashinfer_sparse_mla_sm120():
             raise RuntimeError(
                 "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's "
                 "sparse MLA decode API."
@@ -165,18 +165,6 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         num_actual_toks = q.shape[0]
         runtime_num_heads = q.shape[1]
 
-        # The SM120 v3.2/GLM kernel has one fixed physical Q/K shape:
-        # 512 latent values plus 64 RoPE values. Native NoPE GLM exposes only
-        # the logical 512-D query, while its fp8_ds_mla cache already reserves
-        # (and zero-fills) the physical 64-D RoPE tail. Mirror that zero tail on
-        # Q and select the fixed-shape kernel ABI. The added dot-product term is
-        # exactly zero, so this does not change the logical NoPE attention.
-        kernel_q = q
-        kernel_qk_rope_head_dim = self.qk_rope_head_dim
-        if self.qk_rope_head_dim == 0:
-            kernel_q = torch.nn.functional.pad(q, (0, 64))
-            kernel_qk_rope_head_dim = 64
-
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
@@ -190,6 +178,24 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
                 return_valid_counts=True,
             )
         )
+
+        if self.qk_rope_head_dim == 0:
+            from vllm.v1.attention.backends.mla.triton_mla_sparse_glm import (
+                glm_fp8ds_nope_sparse_mla,
+            )
+
+            out, lse = glm_fp8ds_nope_sparse_mla(
+                q=q,
+                kv_cache=kv_c_and_k_pe_cache.view(torch.uint8),
+                slot_ids=topk_indices_physical,
+                lens=sparse_topk_lens,
+                block_size=attn_metadata.block_size,
+                scale=self.scale,
+            )
+            return out, lse if self.need_to_return_lse_for_decode else None
+
+        kernel_q = q
+        kernel_qk_rope_head_dim = self.qk_rope_head_dim
 
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(q.device)

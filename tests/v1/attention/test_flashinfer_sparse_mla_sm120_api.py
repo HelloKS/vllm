@@ -15,6 +15,9 @@ from vllm.utils import flashinfer as fi_utils
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
 )
+from vllm.v1.attention.backends.mla.triton_mla_sparse_glm import (
+    GlmTritonMLASparseSM120Backend,
+)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
@@ -39,6 +42,45 @@ def test_sm120_backend_uses_sparse_mqa_for_prefill() -> None:
 
     assert impl_cls.is_sparse
     assert not impl_cls.supports_dense_mha_prefill
+
+
+def test_glm_sm120_backend_is_native_triton() -> None:
+    assert GlmTritonMLASparseSM120Backend.get_name() == "TRITON_MLA_SPARSE_GLM_SM120"
+    assert (
+        AttentionBackendEnum.TRITON_MLA_SPARSE_GLM_SM120.get_class()
+        is GlmTritonMLASparseSM120Backend
+    )
+
+
+def test_glm_sm120_triton_backend_does_not_require_flashinfer(monkeypatch) -> None:
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: False)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="glm4_moe",
+                index_topk=2048,
+                kv_lora_rank=512,
+                qk_rope_head_dim=0,
+            )
+        )
+    )
+
+    with set_current_vllm_config(config):
+        invalid_reasons = GlmTritonMLASparseSM120Backend.validate_configuration(
+            head_size=512,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="fp8_ds_mla",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == []
 
 
 def test_v32_glm_sm120_backend_accepts_glm_block_size(

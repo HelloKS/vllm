@@ -188,13 +188,6 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         device_capability: DeviceCapability,
     ) -> str | None:
         from vllm.config import get_current_vllm_config
-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
-
-        if not has_flashinfer_sparse_mla_sm120():
-            return (
-                "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's "
-                "sparse MLA decode API"
-            )
         if dtype != torch.bfloat16:
             return "dtype not supported"
         if kv_cache_dtype not in (
@@ -208,6 +201,15 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         vllm_config = get_current_vllm_config()
         if vllm_config.model_config is not None:
             hf_text_config = vllm_config.model_config.hf_text_config
+            qk_rope_head_dim = int(getattr(hf_text_config, "qk_rope_head_dim", 64))
+            if qk_rope_head_dim != 0:
+                from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+
+                if not has_flashinfer_sparse_mla_sm120():
+                    return (
+                        "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's "
+                        "sparse MLA decode API"
+                    )
             index_topk = getattr(hf_text_config, "index_topk", None)
             if index_topk is None:
                 return (
