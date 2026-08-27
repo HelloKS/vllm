@@ -39,7 +39,10 @@ _GLM_ENTRY_BYTES = 656
 _GLM_QUERY_CHUNK = 128
 _GLM_CANDIDATE_CHUNK = 1024
 _GLM_HEAD_BLOCK = 16
-_GLM_SCORE_BLOCK = 64
+# The score kernel materializes a 512 x BLOCK_C dequantized KV tile in FP32.
+# BLOCK_C=64 alone consumes 128 KiB and cannot fit SM120's 99 KiB shared-memory
+# limit. At 32, the FP32 KV tile is 64 KiB and the 16x512 BF16 Q tile is 16 KiB.
+_GLM_SCORE_BLOCK = 32
 _GLM_VALUE_BLOCK = 128
 
 
@@ -560,10 +563,8 @@ def glm_fp8ds_nope_sparse_mla(
                 HEAD_DIM=_GLM_NOPE_DIM,
                 QUANT_BLOCK=_GLM_QUANT_BLOCK,
                 num_warps=8,
-                # Triton reports 49,152 bytes per pipeline stage for this
-                # 16x512 by 512x64 tile. Two nominal stages leave too little
-                # room for compiler-added shared allocations on SM120, whose
-                # hard limit is 101,376 bytes, so keep this launch single-stage.
+                # Keep the 16x512 by 512x32 launch single-stage as additional
+                # headroom for compiler-created shared allocations.
                 num_stages=1,
             )
 
