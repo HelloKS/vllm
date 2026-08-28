@@ -206,7 +206,22 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         if vllm_config.model_config is not None:
             hf_text_config = vllm_config.model_config.hf_text_config
             qk_rope_head_dim = int(getattr(hf_text_config, "qk_rope_head_dim", 64))
-            if qk_rope_head_dim != 0:
+            if qk_rope_head_dim == 0:
+                from vllm.utils.flashinfer import (
+                    has_flashinfer_sparse_mla_sm120_glm53_nope,
+                )
+
+                num_q_heads = vllm_config.model_config.get_num_attention_heads(
+                    vllm_config.parallel_config
+                )
+                if not has_flashinfer_sparse_mla_sm120_glm53_nope(
+                    num_q_heads, 2176
+                ):
+                    return (
+                        "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's "
+                        "native GLM-5.3 NoPE (32 heads, top-k 2176) kernel"
+                    )
+            else:
                 from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
                 if not has_flashinfer_sparse_mla_sm120():

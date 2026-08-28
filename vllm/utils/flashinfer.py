@@ -264,6 +264,25 @@ def has_flashinfer_sparse_mla_sm120() -> bool:
 
 
 @functools.cache
+def has_flashinfer_sparse_mla_sm120_glm53_nope(
+    num_q_heads: int = 32,
+    top_k: int = 2176,
+) -> bool:
+    """Return whether FlashInfer ships the native GLM-5.3 NoPE kernel.
+
+    The public sparse-MLA callable predates native ``512+0`` support, so its
+    presence alone cannot distinguish a package containing the GLM-5.3
+    specialization from an older build. Inspect the dispatch table introduced
+    by FlashInfer PR #4791 until a public capability query is available.
+    """
+    if not has_flashinfer_sparse_mla_sm120():
+        return False
+    mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
+    dispatch = getattr(mod, "_DECODE_GLM53_NOPE_DISPATCH", None) if mod else None
+    return dispatch is not None and (int(num_q_heads), int(top_k)) in dispatch
+
+
+@functools.cache
 def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool:
     """Return whether FlashInfer ships an SM120 DSV4 decode specialization.
 
@@ -1129,6 +1148,7 @@ __all__ = [
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_b12x_moe",
     "has_flashinfer_b12x_gemm",
+    "has_flashinfer_sparse_mla_sm120_glm53_nope",
     "has_flashinfer_fp8_blockscale_gemm",
     "has_nvidia_artifactory",
     "supports_trtllm_attention",

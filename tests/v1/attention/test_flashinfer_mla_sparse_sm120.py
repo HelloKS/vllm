@@ -8,7 +8,7 @@ import torch
 from vllm.v1.attention.backends.mla import flashinfer_mla_sparse_sm120 as sm120
 
 
-def test_nope_forward_uses_native_d512_triton_kernel(monkeypatch):
+def test_nope_forward_uses_native_flashinfer_2176_kernel(monkeypatch):
     impl = object.__new__(sm120.FlashInferMLASparseSM120Impl)
     impl.num_heads = 2
     impl.kv_lora_rank = 512
@@ -20,7 +20,7 @@ def test_nope_forward_uses_native_d512_triton_kernel(monkeypatch):
     impl.topk_indices_buffer = torch.tensor(
         [[3, -1, -1, -1], [-1, -1, -1, -1]], dtype=torch.int32
     )
-    impl._workspace_buffer = None
+    impl._workspace_buffer = torch.empty(1, dtype=torch.uint8)
 
     valid_lens = torch.tensor([1, 0], dtype=torch.int32)
 
@@ -30,17 +30,16 @@ def test_nope_forward_uses_native_d512_triton_kernel(monkeypatch):
 
     captured = {}
 
-    def fake_triton(**kwargs):
+    def fake_decode(**kwargs):
         captured.update(kwargs)
-        out = torch.full((2, 2, 512), 7, dtype=torch.bfloat16)
+        kwargs["out"].fill_(7)
         lse = torch.zeros(2, 2, dtype=torch.float32)
-        return out, lse
+        return kwargs["out"], lse
 
     monkeypatch.setattr(sm120, "triton_convert_req_index_to_global_index", fake_convert)
     monkeypatch.setattr(
-        "vllm.v1.attention.backends.mla.triton_mla_sparse_glm."
-        "glm_fp8ds_nope_sparse_mla",
-        fake_triton,
+        "vllm.utils.flashinfer.flashinfer_trtllm_batch_decode_with_kv_cache_mla",
+        fake_decode,
     )
 
     metadata = SimpleNamespace(
@@ -55,13 +54,19 @@ def test_nope_forward_uses_native_d512_triton_kernel(monkeypatch):
     out, lse = impl.forward_mqa(q, kv_cache, metadata, layer=None)
 
     assert lse is None
-    assert captured["q"].shape == (2, 2, 512)
-    assert torch.equal(captured["q"], q)
-    assert torch.equal(captured["lens"], valid_lens)
-    assert captured["slot_ids"].shape == (2, 4)
-    assert captured["block_size"] == 64
+    assert captured["query"].shape == (2, 1, 2, 512)
+    assert torch.equal(captured["query"].squeeze(1), q)
+    assert captured["qk_rope_head_dim"] == 0
+    assert captured["kv_scale_format"] == "arbitrary_fp32"
+    assert captured["sparse_mla_top_k"] == 2176
+    assert captured["max_seq_len"] == 2176
+    assert captured["block_tables"].shape == (2, 1, 2176)
+    assert captured["block_tables"].is_contiguous()
+    assert captured["seq_lens"].tolist() == [1, 1]
+    assert captured["sparse_mla_top_k_lens"].tolist() == [1, 1]
+    assert captured["block_tables"][0, 0, :4].tolist() == [3, -1, -1, -1]
     assert torch.count_nonzero(out[0] - 7) == 0
-    assert torch.count_nonzero(out[1] - 7) == 0
+    assert torch.count_nonzero(out[1]) == 0
 
 
 def test_kpool_tail_uses_second_fixed_topk_partition(monkeypatch):

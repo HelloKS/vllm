@@ -23,7 +23,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 
-_SM120_GLM_TOPK = 2048
+_SM120_GLM_HISTORY_TOPK = 2048
+_SM120_GLM53_NOPE_TOPK = 2176
 
 
 def _normalize_lse(
@@ -140,9 +141,20 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             if indexer is not None
             else mla_args.get("topk_indices_buffer")
         )
-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+        from vllm.utils.flashinfer import (
+            has_flashinfer_sparse_mla_sm120,
+            has_flashinfer_sparse_mla_sm120_glm53_nope,
+        )
 
-        if self.qk_rope_head_dim != 0 and not has_flashinfer_sparse_mla_sm120():
+        if self.qk_rope_head_dim == 0:
+            if not has_flashinfer_sparse_mla_sm120_glm53_nope(
+                self.num_heads, _SM120_GLM53_NOPE_TOPK
+            ):
+                raise RuntimeError(
+                    "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's native "
+                    "GLM-5.3 NoPE (32 heads, top-k 2176) kernel."
+                )
+        elif not has_flashinfer_sparse_mla_sm120():
             raise RuntimeError(
                 "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's "
                 "sparse MLA decode API."
@@ -179,21 +191,6 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             )
         )
 
-        if self.qk_rope_head_dim == 0:
-            from vllm.v1.attention.backends.mla.triton_mla_sparse_glm import (
-                glm_fp8ds_nope_sparse_mla,
-            )
-
-            out, lse = glm_fp8ds_nope_sparse_mla(
-                q=q,
-                kv_cache=kv_c_and_k_pe_cache.view(torch.uint8),
-                slot_ids=topk_indices_physical,
-                lens=sparse_topk_lens,
-                block_size=attn_metadata.block_size,
-                scale=self.scale,
-            )
-            return out, lse if self.need_to_return_lse_for_decode else None
-
         kernel_q = q
         kernel_qk_rope_head_dim = self.qk_rope_head_dim
 
@@ -208,8 +205,14 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             indices: torch.Tensor,
             lengths: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            kernel_topk = indices.shape[1]
             empty_rows = lengths == 0
             indices[:, 0] = indices[:, 0].masked_fill(empty_rows, 0)
+            extra_kwargs: dict[str, torch.Tensor] = {}
+            if self.qk_rope_head_dim == 0:
+                # Native NoPE sparse MLA requires the active compacted width
+                # separately from seq_lens/page-table capacity.
+                extra_kwargs["sparse_mla_top_k_lens"] = lengths.clamp(min=1)
             output = q.new_empty(
                 (num_actual_toks, runtime_num_heads, self.kv_lora_rank),
                 dtype=q.dtype,
@@ -223,13 +226,14 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
                 qk_rope_head_dim=kernel_qk_rope_head_dim,
                 block_tables=indices.unsqueeze(1),
                 seq_lens=lengths.clamp(min=1),
-                max_seq_len=_SM120_GLM_TOPK,
+                max_seq_len=kernel_topk,
                 out=output.unsqueeze(1),
                 bmm1_scale=self.scale,
                 bmm2_scale=1.0,
-                sparse_mla_top_k=_SM120_GLM_TOPK,
+                sparse_mla_top_k=kernel_topk,
                 return_lse=True,
                 kv_scale_format=self.kv_scale_format,
+                **extra_kwargs,
             )
             if not isinstance(kernel_out, tuple):
                 raise RuntimeError(
@@ -242,6 +246,24 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
             return out, lse
 
+        if self.qk_rope_head_dim == 0:
+            if topk_indices_physical.shape[1] > _SM120_GLM53_NOPE_TOPK:
+                raise RuntimeError(
+                    "GLM-5.3 native NoPE sparse MLA received an index buffer "
+                    f"wider than {_SM120_GLM53_NOPE_TOPK}: "
+                    f"{topk_indices_physical.shape[1]}"
+                )
+            native_indices = topk_indices_physical.contiguous()
+            if native_indices.shape[1] < _SM120_GLM53_NOPE_TOPK:
+                native_indices = torch.nn.functional.pad(
+                    native_indices,
+                    (0, _SM120_GLM53_NOPE_TOPK - native_indices.shape[1]),
+                    value=-1,
+                )
+            native_lens = sparse_topk_lens.clamp(max=_SM120_GLM53_NOPE_TOPK)
+            out, lse = run_partition(native_indices, native_lens)
+            return out, lse if self.need_to_return_lse_for_decode else None
+
         # GLM kpool deliberately emits index_topk history tokens plus the
         # incomplete trailing pool (up to kpool - 1 tokens). Its 2176-column
         # buffer is capacity padding, while the SM120 GLM kernel is compiled
@@ -252,29 +274,34 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         # A column slice of the 2176-wide kpool buffer retains row stride 2176
         # and is therefore not contiguous when there is more than one query.
         # FlashInfer's FFI requires a dense [tokens, 2048] indices tensor.
-        main_indices = topk_indices_physical[:, :_SM120_GLM_TOPK].contiguous()
-        if main_indices.shape[1] < _SM120_GLM_TOPK:
+        main_indices = topk_indices_physical[
+            :, :_SM120_GLM_HISTORY_TOPK
+        ].contiguous()
+        if main_indices.shape[1] < _SM120_GLM_HISTORY_TOPK:
             main_indices = torch.nn.functional.pad(
-                main_indices, (0, _SM120_GLM_TOPK - main_indices.shape[1]), value=-1
+                main_indices,
+                (0, _SM120_GLM_HISTORY_TOPK - main_indices.shape[1]),
+                value=-1,
             )
-        main_lens = sparse_topk_lens.clamp(max=_SM120_GLM_TOPK)
+        main_lens = sparse_topk_lens.clamp(max=_SM120_GLM_HISTORY_TOPK)
         main_out, main_lse = run_partition(main_indices, main_lens)
 
-        if topk_indices_physical.shape[1] > _SM120_GLM_TOPK:
+        if topk_indices_physical.shape[1] > _SM120_GLM_HISTORY_TOPK:
             tail_indices = torch.full(
-                (num_actual_toks, _SM120_GLM_TOPK),
+                (num_actual_toks, _SM120_GLM_HISTORY_TOPK),
                 -1,
                 dtype=topk_indices_physical.dtype,
                 device=topk_indices_physical.device,
             )
             tail_width = min(
-                topk_indices_physical.shape[1] - _SM120_GLM_TOPK,
-                _SM120_GLM_TOPK,
+                topk_indices_physical.shape[1] - _SM120_GLM_HISTORY_TOPK,
+                _SM120_GLM_HISTORY_TOPK,
             )
             tail_indices[:, :tail_width] = topk_indices_physical[
-                :, _SM120_GLM_TOPK : _SM120_GLM_TOPK + tail_width
+                :,
+                _SM120_GLM_HISTORY_TOPK : _SM120_GLM_HISTORY_TOPK + tail_width,
             ]
-            tail_lens = (sparse_topk_lens - _SM120_GLM_TOPK).clamp(
+            tail_lens = (sparse_topk_lens - _SM120_GLM_HISTORY_TOPK).clamp(
                 min=0, max=tail_width
             )
             tail_out, tail_lse = run_partition(tail_indices, tail_lens)

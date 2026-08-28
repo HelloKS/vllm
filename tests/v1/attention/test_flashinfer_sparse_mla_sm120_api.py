@@ -87,6 +87,52 @@ def test_glm_sm120_triton_backend_does_not_require_flashinfer(monkeypatch) -> No
     assert invalid_reasons == []
 
 
+def test_glm53_nope_flashinfer_backend_requires_native_dispatch(monkeypatch) -> None:
+    model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            model_type="glm4_moe",
+            index_topk=2048,
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+        ),
+        get_num_attention_heads=lambda _parallel_config: 32,
+    )
+    config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+    )
+
+    def validate() -> list[str]:
+        with set_current_vllm_config(config):
+            return FlashInferMLASparseSM120Backend.validate_configuration(
+                head_size=512,
+                dtype=torch.bfloat16,
+                kv_cache_dtype="fp8_ds_mla",
+                block_size=64,
+                use_mla=True,
+                has_sink=False,
+                use_sparse=True,
+                use_mm_prefix=False,
+                use_per_head_quant_scales=False,
+                device_capability=DeviceCapability(12, 0),
+                attn_type="decoder",
+            )
+
+    monkeypatch.setattr(
+        fi_utils,
+        "has_flashinfer_sparse_mla_sm120_glm53_nope",
+        lambda _heads, _topk: False,
+    )
+    assert any("native GLM-5.3 NoPE" in reason for reason in validate())
+
+    monkeypatch.setattr(
+        fi_utils,
+        "has_flashinfer_sparse_mla_sm120_glm53_nope",
+        lambda heads, topk: (heads, topk) == (32, 2176),
+    )
+    assert validate() == []
+
+
 def test_v32_glm_sm120_backend_accepts_glm_block_size(
     monkeypatch,
 ) -> None:
@@ -124,6 +170,21 @@ def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
     assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(16, 192)
 
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+
+
+def test_sm120_glm53_nope_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
+    fake_module = SimpleNamespace(
+        _DECODE_GLM53_NOPE_DISPATCH=frozenset({(32, 2176)})
+    )
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
+    monkeypatch.setattr(fi_utils, "_get_submodule", lambda _name: fake_module)
+    fi_utils.has_flashinfer_sparse_mla_sm120_glm53_nope.cache_clear()
+
+    assert fi_utils.has_flashinfer_sparse_mla_sm120_glm53_nope(32, 2176)
+    assert not fi_utils.has_flashinfer_sparse_mla_sm120_glm53_nope(16, 2176)
+    assert not fi_utils.has_flashinfer_sparse_mla_sm120_glm53_nope(32, 2048)
+
+    fi_utils.has_flashinfer_sparse_mla_sm120_glm53_nope.cache_clear()
 
 
 def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:

@@ -130,8 +130,10 @@ def _get_backend_priorities(
         elif device_capability.major == 12:
             return [
                 AttentionBackendEnum.TRITON_MLA,
-                AttentionBackendEnum.TRITON_MLA_SPARSE_GLM_SM120,
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+                # Validation rejects FlashInfer builds without native GLM-5.3
+                # NoPE support and falls through to the Triton implementation.
+                AttentionBackendEnum.TRITON_MLA_SPARSE_GLM_SM120,
             ]
         else:
             # Prefer FlashInfer FA3 for GLM-5.3-Flash NoPE sparse MLA on SM90;
