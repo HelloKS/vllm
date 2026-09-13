@@ -777,6 +777,7 @@ class CompilationConfig:
         # The fused prepare calls this op instead of the one above.
         "vllm::qwen4_exp_qsa_prepare_with_output",
         "vllm::linear_attention",
+        "vllm::solar_open2_kda_attention",
         "vllm::qwen_gdn_attention_core",
         "vllm::qwen_gdn_attention_core_fused_norm_packed",
         "vllm::gdn_attention_core_xpu",
