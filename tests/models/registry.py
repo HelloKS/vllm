@@ -568,6 +568,11 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "SolarForCausalLM": _HfExamplesInfo(
         "upstage/solar-pro-preview-instruct", trust_remote_code=True
     ),
+    "SolarOpen2ForCausalLM": _HfExamplesInfo(
+        "upstage/Solar-Open2-250B",
+        use_original_num_layers=True,
+        hf_overrides={"num_hidden_layers": 4, "gqa_layers": [0]},
+    ),
     "TeleChat2ForCausalLM": _HfExamplesInfo(
         "Tele-AI/TeleChat2-3B", trust_remote_code=True
     ),
