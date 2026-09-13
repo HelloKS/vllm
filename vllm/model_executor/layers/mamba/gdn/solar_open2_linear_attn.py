@@ -38,6 +38,7 @@ from ..mamba_utils import (
     is_conv_state_dim_first,
 )
 from ..ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from ..ops.gather_initial_states import gather_initial_states
 
 logger = init_logger(__name__)
 
@@ -100,7 +101,11 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         return MambaStateShapeCalculator.kda_state_shape(
-            self.tp_size, self.num_heads, self.head_dim, conv_kernel_size=self.conv_size
+            self.tp_size,
+            self.num_heads,
+            self.head_dim,
+            conv_kernel_size=self.conv_size,
+            num_spec=self.num_spec,
         )
 
     def __init__(
@@ -110,9 +115,12 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
         prefix: str = "",
     ) -> None:
         super().__init__(config, vllm_config, prefix)
-        if vllm_config.speculative_config is not None:
+        if (
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.method != "dspark"
+        ):
             raise NotImplementedError(
-                "Solar Open 2 does not support speculative decoding"
+                "Solar Open 2 currently supports only DSpark speculative decoding"
             )
 
         # Flipped True after the first V1 profile run warms up the autotuned KDA
@@ -403,122 +411,135 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
         if attn_metadata_narrowed is None:
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
-        has_initial_state = attn_metadata_narrowed.has_initial_state
-        non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
-        non_spec_state_indices_tensor = (
-            attn_metadata_narrowed.non_spec_state_indices_tensor
-        )  # noqa: E501
-        num_actual_tokens = attn_metadata_narrowed.num_actual_tokens
-        constant_caches = self.kv_cache
-
-        q_proj_states = q_proj_states[:num_actual_tokens]
-        k_proj_states = k_proj_states[:num_actual_tokens]
-        v_proj_states = v_proj_states[:num_actual_tokens]
+        m = attn_metadata_narrowed
+        num_actual_tokens = m.num_actual_tokens
+        projections = [
+            x[:num_actual_tokens] for x in (q_proj_states, k_proj_states, v_proj_states)
+        ]
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
-        conv_state, recurrent_state = constant_caches
-        # conv_state must be (..., dim, width-1) for the conv kernels.
-        # DS layout stores it that way directly; SD layout needs a transpose.
+        conv_state, recurrent_state = self.kv_cache
         if not is_conv_state_dim_first():
             conv_state = conv_state.transpose(-1, -2)
-        conv_state_q, conv_state_k, conv_state_v = conv_state.split(
-            self.local_num_heads * self.head_dim, dim=-2
-        )
+        conv_states = conv_state.split(self.local_num_heads * self.head_dim, dim=-2)
+        conv_layers = (self.q_conv1d, self.k_conv1d, self.v_conv1d)
+        conv_weights = [layer.weight.squeeze(1) for layer in conv_layers]
 
-        q_conv_weights = self.q_conv1d.weight.view(
-            self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2)
-        )
-        k_conv_weights = self.k_conv1d.weight.view(
-            self.k_conv1d.weight.size(0), self.k_conv1d.weight.size(2)
-        )
-        v_conv_weights = self.v_conv1d.weight.view(
-            self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
-        )
-        if attn_metadata_narrowed.num_prefills > 0:
-            q_proj_states = q_proj_states.transpose(0, 1)
-            k_proj_states = k_proj_states.transpose(0, 1)
-            v_proj_states = v_proj_states.transpose(0, 1)
-            q = causal_conv1d_fn(
-                q_proj_states,
-                q_conv_weights,
-                self.q_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_q,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
-            k = causal_conv1d_fn(
-                k_proj_states,
-                k_conv_weights,
-                self.k_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_k,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
-            v = causal_conv1d_fn(
-                v_proj_states,
-                v_conv_weights,
-                self.v_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_v,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
-        else:
-            assert non_spec_state_indices_tensor is not None
-            decode_conv_indices = non_spec_state_indices_tensor[
-                : attn_metadata_narrowed.num_actual_tokens
+        if m.spec_sequence_masks is not None:
+            if m.num_prefills == 0 and m.num_decodes == 0:
+                spec_projections = projections
+                spec_g, spec_beta = g1, beta
+                projections = []
+            else:
+                assert m.spec_token_indx is not None
+                assert m.non_spec_token_indx is not None
+                spec_projections = [
+                    x.index_select(0, m.spec_token_indx) for x in projections
+                ]
+                projections = [
+                    x.index_select(0, m.non_spec_token_indx) for x in projections
+                ]
+                spec_g = g1.index_select(1, m.spec_token_indx)
+                spec_beta = beta.index_select(1, m.spec_token_indx)
+                g1 = g1.index_select(1, m.non_spec_token_indx)
+                beta = beta.index_select(1, m.non_spec_token_indx)
+
+            assert m.spec_state_indices_tensor is not None
+            assert m.spec_query_start_loc is not None
+            assert m.num_accepted_tokens is not None
+            spec_indices = m.spec_state_indices_tensor
+            q, k, v = [
+                rearrange(
+                    causal_conv1d_update(
+                        x,
+                        state,
+                        weight,
+                        layer.bias,
+                        activation="silu",
+                        conv_state_indices=spec_indices[:, 0][: m.num_spec_decodes],
+                        num_accepted_tokens=m.num_accepted_tokens,
+                        query_start_loc=m.spec_query_start_loc,
+                        max_query_len=spec_indices.size(-1),
+                        validate_data=False,
+                    ),
+                    "n (h d) -> 1 n h d",
+                    d=self.head_dim,
+                )
+                for x, state, weight, layer in zip(
+                    spec_projections, conv_states, conv_weights, conv_layers
+                )
             ]
-            q = causal_conv1d_update(
-                q_proj_states,
-                conv_state_q,
-                q_conv_weights,
-                self.q_conv1d.bias,
-                activation="silu",
-                conv_state_indices=decode_conv_indices,
-                validate_data=True,
+            # Read the previous accepted state and save each candidate's state
+            # so the next verification can discard a rejected suffix.
+            spec_out, _ = fused_recurrent_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=spec_g,
+                beta=spec_beta,
+                initial_state=recurrent_state,
+                cu_seqlens=m.spec_query_start_loc[: m.num_spec_decodes + 1],
+                ssm_state_indices=spec_indices,
+                num_accepted_tokens=m.num_accepted_tokens,
             )
-            k = causal_conv1d_update(
-                k_proj_states,
-                conv_state_k,
-                k_conv_weights,
-                self.k_conv1d.bias,
-                activation="silu",
-                conv_state_indices=decode_conv_indices,
-                validate_data=True,
-            )
-            v = causal_conv1d_update(
-                v_proj_states,
-                conv_state_v,
-                v_conv_weights,
-                self.v_conv1d.bias,
-                activation="silu",
-                conv_state_indices=decode_conv_indices,
-                validate_data=True,
-            )
+            if projections:
+                core_attn_out.index_copy_(1, m.spec_token_indx, spec_out)
+            else:
+                # The recurrent kernel leaves graph-padding rows unwritten.
+                core_attn_out[:, : m.num_spec_decode_tokens] = spec_out[
+                    :, : m.num_spec_decode_tokens
+                ]
 
-        q, k, v = map(
-            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim), (q, k, v)
-        )
+        if not projections:
+            return
 
-        if attn_metadata_narrowed.num_prefills > 0:
-            assert non_spec_state_indices_tensor is not None
-            assert has_initial_state is not None
-            zero_idx = non_spec_state_indices_tensor[~has_initial_state]
-            recurrent_state[zero_idx] = 0
-            initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = chunk_kda(
+        state_indices = m.non_spec_state_indices_tensor
+        query_start_loc = m.non_spec_query_start_loc
+        assert state_indices is not None
+        assert query_start_loc is not None
+        if m.num_prefills > 0:
+            q, k, v = [
+                causal_conv1d_fn(
+                    x.transpose(0, 1),
+                    weight,
+                    layer.bias,
+                    activation="silu",
+                    conv_states=state,
+                    has_initial_state=m.has_initial_state,
+                    cache_indices=state_indices,
+                    query_start_loc=query_start_loc,
+                    metadata=m,
+                ).transpose(0, 1)
+                for x, state, weight, layer in zip(
+                    projections, conv_states, conv_weights, conv_layers
+                )
+            ]
+        else:
+            q, k, v = [
+                causal_conv1d_update(
+                    x,
+                    state,
+                    weight,
+                    layer.bias,
+                    activation="silu",
+                    conv_state_indices=state_indices[: x.size(0)],
+                    validate_data=True,
+                )
+                for x, state, weight, layer in zip(
+                    projections, conv_states, conv_weights, conv_layers
+                )
+            ]
+        q, k, v = [
+            rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim) for x in (q, k, v)
+        ]
+
+        if m.num_prefills > 0:
+            assert m.has_initial_state is not None
+            initial_state = gather_initial_states(
+                recurrent_state, state_indices, m.has_initial_state
+            )
+            non_spec_out, last_recurrent_state = chunk_kda(
                 q=q,
                 k=k,
                 v=v,
@@ -527,28 +548,25 @@ class SolarOpen2KimiDeltaAttention(GatedDeltaNetAttention):
                 initial_state=initial_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc,
+                cu_seqlens=query_start_loc,
             )
-            # Init cache
-            recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+            recurrent_state[state_indices] = last_recurrent_state
         else:
-            assert non_spec_query_start_loc is not None
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = fused_recurrent_kda(
+            non_spec_out, _ = fused_recurrent_kda(
                 q=q,
                 k=k,
                 v=v,
                 g=g1,
                 beta=beta,
                 initial_state=recurrent_state,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc[
-                    : attn_metadata_narrowed.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
+                cu_seqlens=query_start_loc[: m.num_decodes + 1],
+                ssm_state_indices=state_indices,
             )
-        core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
-            0, :num_actual_tokens
-        ]
+        if m.spec_sequence_masks is not None:
+            assert m.non_spec_token_indx is not None
+            core_attn_out.index_copy_(1, m.non_spec_token_indx, non_spec_out)
+        else:
+            num_non_spec_tokens = m.num_prefill_tokens + m.num_decode_tokens
+            core_attn_out[:, :num_non_spec_tokens] = non_spec_out[
+                :, :num_non_spec_tokens
+            ]
