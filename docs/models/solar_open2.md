@@ -21,6 +21,9 @@ Choose the parallelism and maximum context length for the available GPU memory.
 The model's configured maximum context length is 1,048,576 tokens.
 
 The template logits processor defaults to a reasoning budget of 131,072 tokens.
+The same processor path supports both the V1 and V2 model runners. On V2 it
+reads committed token history back to the CPU and evaluates draft prefixes
+separately; this adds device synchronization overhead.
 Set `SOLAR_REASONING_BUDGET` to change that default; zero disables the budget.
 Requests can override it with `solar_open2_reasoning_budget` in `vllm_xargs`,
 or disable the processor with `disable_solar_open2_logits_processor: 1`.
@@ -58,11 +61,12 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve nota-ai/Solar-Open2-250B-Nota-NVFP4 \
 
 Adjust tensor parallelism and memory limits for your hardware. DSpark requires
 the V2 GPU model runner. Pipeline parallelism is not supported for Solar DSpark.
-Do not pass `--logits-processors`: custom logits processors are incompatible
-with this path. The reasoning and tool parsers still interpret generated output,
-but the template control-token constraints and separate reasoning budget are
-not enforced. Setting the per-request processor-disable flag is insufficient
-if the processor is still registered at server startup.
+The example omits the template logits processor. Add
+`--logits-processors vllm.v1.sample.logits_processor.solar_open2:SolarOpen2TemplateLogitsProcessor`
+to enforce its control-token constraints and separate reasoning budget with
+V2 speculative decoding. Without it, the reasoning and tool parsers interpret
+generated output but do not enforce those constraints. The processor's CPU
+synchronization overhead and end-to-end DSpark performance remain unverified.
 
 The published config omits `sample_from_anchor`; the existing DSpark default
 (`true`) is used, giving seven draft query positions and eight target verification

@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -1027,3 +1029,132 @@ def test_resolve_think_leading_forbidden_ids_env_override(
     monkeypatch.setenv(THINK_LEADING_FORBIDDEN_IDS_ENV, "not-json")
     with pytest.raises(ValueError):
         resolve_solar_open2_think_leading_forbidden_ids(_leading_vllm_config(None))
+
+
+@pytest.fixture
+def v2_processor(monkeypatch):
+    import vllm.v1.sample.logits_processor.solar_open2 as solar
+    from vllm.v1.worker.gpu.sample.logits_processor import LogitsProcRequestState
+
+    monkeypatch.setattr(solar, "resolve_solar_open2_token_ids", lambda _: IDS)
+    monkeypatch.setattr(
+        solar, "resolve_solar_open2_extra_eos_ids", lambda *_: frozenset({EOS_ID})
+    )
+    monkeypatch.setattr(
+        solar, "resolve_solar_open2_think_leading_forbidden_ids", lambda _: frozenset()
+    )
+    monkeypatch.setenv(REASONING_BUDGET_ENV, "0")
+    states = LogitsProcRequestState(
+        device=torch.device("cpu"),
+        max_num_reqs=4,
+        vocab_size=VOCAB_SIZE,
+        all_token_ids=SimpleNamespace(gpu=torch.zeros(4, 32, dtype=torch.int64)),
+        prompt_len=SimpleNamespace(np=np.ones(4, dtype=np.int64)),
+        prefill_len=SimpleNamespace(np=np.ones(4, dtype=np.int64)),
+        total_len=SimpleNamespace(gpu=torch.ones(4, dtype=torch.int64)),
+    )
+    states.all_token_ids.gpu[:, 0] = IDS.think_start
+    return SolarOpen2TemplateLogitsProcessor(None, states), states
+
+
+def _v2_context(states, requests):
+    from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext
+
+    slots, local_pos, positions, inputs = [], [], [], []
+    for slot, drafts in requests:
+        total_len = int(states.total_len.gpu[slot])
+        last_token = int(states.all_token_ids.gpu[slot, total_len - 1])
+        tokens = [last_token, *drafts]
+        slots.extend([slot] * len(tokens))
+        local_pos.extend(range(len(tokens)))
+        positions.extend(range(total_len - 1, total_len + len(drafts)))
+        inputs.extend(tokens)
+    mapping = np.array([slot for slot, _ in requests], dtype=np.int64)
+    return LogitsContext(
+        expanded_idx_mapping=torch.tensor(slots),
+        idx_mapping=torch.from_numpy(mapping),
+        idx_mapping_np=mapping,
+        expanded_local_pos=torch.tensor(local_pos),
+        input_ids=torch.tensor(inputs),
+        pos=torch.tensor(positions),
+        seq_lens_upper_bound_np=np.array(
+            [int(states.total_len.gpu[slot]) + len(drafts) for slot, drafts in requests]
+        ),
+    )
+
+
+@pytest.mark.parametrize("prompt,output,structured", _BATCH_SCENARIOS)
+def test_v2_masks_match_request_fsm(v2_processor, prompt, output, structured):
+    from vllm.sampling_params import StructuredOutputsParams
+
+    proc, states = v2_processor
+    history = prompt + output
+    states.prompt_len.np[2] = len(prompt)
+    states.total_len.gpu[2] = len(history)
+    states.all_token_ids.gpu[2, : len(history)] = torch.tensor(history)
+    params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(json_object=True)
+        if structured
+        else None
+    )
+    assert proc.add_request(2, params)
+    actual = proc.apply(_logits().unsqueeze(0), _v2_context(states, [(2, [])]))
+    expected = _factory(structured)(prompt, output, _logits())
+    assert torch.equal(actual[0], expected)
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 2])
+def test_v2_rejected_drafts_do_not_change_committed_state(v2_processor, accepted):
+    proc, states = v2_processor
+    proc.add_request(2, SamplingParams())
+    proc.add_request(0, SamplingParams())
+    drafts = [IDS.think_end, REGULAR_TOKEN]
+    actual = proc.apply(_batch_logits(4), _v2_context(states, [(2, drafts), (0, [])]))
+    expected = _batch_logits(4)
+    for row in range(3):
+        _factory()([IDS.think_start], drafts[:row], expected[row])
+    _factory()([IDS.think_start], [], expected[3])
+    assert torch.equal(actual, expected)
+
+    # Reorder the batch, commit only accepted drafts plus the sampled token,
+    # and replace the rejected suffix with a different draft of the same length.
+    output = drafts[:accepted] + [REGULAR_TOKEN]
+    states.total_len.gpu[2] = 1 + len(output)
+    states.all_token_ids.gpu[2, 1 : 1 + len(output)] = torch.tensor(output)
+    next_drafts = [REGULAR_TOKEN, IDS.think_end]
+    actual = proc.apply(
+        _batch_logits(4), _v2_context(states, [(0, []), (2, next_drafts)])
+    )
+    expected = _batch_logits(4)
+    _factory()([IDS.think_start], [], expected[0])
+    for offset in range(3):
+        _factory()(
+            [IDS.think_start], output + next_drafts[:offset], expected[offset + 1]
+        )
+    assert torch.equal(actual, expected)
+
+
+def test_v2_slot_reuse_clears_disabled_and_previous_request_state(v2_processor):
+    proc, states = v2_processor
+    proc.add_request(2, SamplingParams())
+    states.all_token_ids.gpu[2, 1:3] = torch.tensor([IDS.think_end, REGULAR_TOKEN])
+    states.total_len.gpu[2] = 3
+    proc.apply(_logits().unsqueeze(0), _v2_context(states, [(2, [])]))
+    assert not proc.add_request(2, SamplingParams(extra_args={DISABLE_EXTRA_ARG: 1}))
+    ctx = _v2_context(states, [(2, [])])
+    assert torch.equal(proc.apply(_logits().unsqueeze(0), ctx)[0], _logits())
+    states.total_len.gpu[2] = 1
+    proc.add_request(2, SamplingParams())
+    actual = proc.apply(_logits().unsqueeze(0), _v2_context(states, [(2, [])]))
+    assert torch.equal(actual[0], _factory()([IDS.think_start], [], _logits()))
+
+
+def test_v2_budget_forcing_preserves_grammar_mask(v2_processor):
+    proc, states = v2_processor
+    proc.add_request(2, SamplingParams(extra_args={REASONING_BUDGET_EXTRA_ARG: 1}))
+    ctx = _v2_context(states, [(2, [REGULAR_TOKEN])])
+    logits = _batch_logits(2)
+    logits[1, IDS.think_end] = float("-inf")
+    actual = proc.apply(logits, ctx)
+    assert _is_available(actual[0], REGULAR_TOKEN)
+    assert torch.isneginf(actual[1]).all()

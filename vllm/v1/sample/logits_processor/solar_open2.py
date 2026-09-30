@@ -3,6 +3,7 @@
 
 import json
 import os
+from copy import copy
 from dataclasses import dataclass, fields
 from enum import Enum
 from functools import lru_cache
@@ -15,7 +16,13 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import (
     AdapterLogitsProcessor,
-    RequestLogitsProcessor,
+)
+from vllm.v1.worker.gpu.sample.logits_processor import (
+    LogitsContext,
+    LogitsProcRequestState,
+)
+from vllm.v1.worker.gpu.sample.logits_processor import (
+    LogitsProcessor as V2LogitsProcessor,
 )
 
 if TYPE_CHECKING:
@@ -733,6 +740,9 @@ class SolarOpen2TokenFSMEnforcer:
           phase).
         """
         self._update_state_incremental(output_token_ids)
+        return self._mask_ids()
+
+    def _mask_ids(self) -> tuple[int, ...] | str | None:
         state = self._state
         if self._has_structured_outputs and state == SolarOpen2State.CONTENT:
             return None
@@ -796,8 +806,8 @@ def _has_structured_outputs(params: SamplingParams) -> bool:
     )
 
 
-class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
-    """Batch-level adapter for the Solar Open2 token FSM."""
+class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor, V2LogitsProcessor):
+    """Solar Open2 token FSM adapter for both model runner interfaces."""
 
     @classmethod
     def validate_params(cls, params: SamplingParams):
@@ -821,9 +831,15 @@ class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
     def __init__(
         self,
         vllm_config: "VllmConfig",
-        device: torch.device,
-        is_pin_memory: bool,
+        device: torch.device | LogitsProcRequestState,
+        is_pin_memory: bool = False,
     ):
+        self._v2_req_states = (
+            device if isinstance(device, LogitsProcRequestState) else None
+        )
+        self._v2_requests: dict[int, _SolarOpen2RequestFactory] = {}
+        if isinstance(device, LogitsProcRequestState):
+            device = device.device
         super().__init__(vllm_config, device, is_pin_memory)
         self.token_ids = resolve_solar_open2_token_ids(vllm_config)
         self.extra_eos_token_ids = resolve_solar_open2_extra_eos_ids(
@@ -853,7 +869,7 @@ class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
     def new_req_logits_processor(
         self,
         params: SamplingParams,
-    ) -> RequestLogitsProcessor | None:
+    ) -> "_SolarOpen2RequestFactory | None":
         self.validate_params(params)
         extra_args = params.extra_args or {}
         disable = extra_args.get(DISABLE_EXTRA_ARG)
@@ -872,7 +888,65 @@ class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
             leading_forbidden_ids=self.think_leading_forbidden_ids,
         )
 
-    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
+        factory = self.new_req_logits_processor(sampling_params)
+        self._v2_requests.pop(req_idx, None)
+        if factory is None:
+            return False
+        self._v2_requests[req_idx] = factory
+        return True
+
+    def _apply_v2(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
+        req_states = self._v2_req_states
+        assert req_states is not None
+        active_slots = [int(idx) for idx in ctx.idx_mapping_np]
+        if not any(idx in self._v2_requests for idx in active_slots):
+            return logits
+
+        # Only committed tokens advance persistent state. Draft prefixes use a
+        # temporary FSM so rejected drafts cannot leak into the next step.
+        slots, local_pos, positions, input_ids = torch.stack(
+            (ctx.expanded_idx_mapping, ctx.expanded_local_pos, ctx.pos, ctx.input_ids)
+        ).tolist()
+        total_lens = req_states.total_len.gpu[ctx.idx_mapping].tolist()
+        rows_by_slot: dict[int, list[int]] = {}
+        for row, slot in enumerate(slots):
+            rows_by_slot.setdefault(slot, []).append(row)
+        rows_by_ids: dict[tuple[int, ...], list[int]] = {}
+        force_rows: list[int] = []
+        for slot, total_len in zip(active_slots, total_lens):
+            factory = self._v2_requests.get(slot)
+            if factory is None:
+                continue
+            rows = sorted(rows_by_slot[slot], key=lambda row: local_pos[row])
+            prompt_len = int(req_states.prompt_len.np[slot])
+            history = req_states.all_token_ids.gpu[slot]
+            if factory._enforcer is None:
+                factory._get_enforcer(history[:prompt_len].tolist())
+            enforcer = factory._enforcer
+            assert enforcer is not None
+            committed_len = min(total_len, positions[rows[0]] + 1)
+            output_len = max(0, committed_len - prompt_len)
+            if output_len < enforcer._last_processed_len:
+                enforcer._reset_to_prompt_state()
+            start = prompt_len + enforcer._last_processed_len
+            for token_id in history[start:committed_len].tolist():
+                enforcer._process_token(token_id)
+            enforcer._last_processed_len = output_len
+            draft_enforcer = copy(enforcer)
+            for row in rows:
+                if local_pos[row] > 0:
+                    draft_enforcer._process_token(input_ids[row])
+                directive = draft_enforcer._mask_ids()
+                if isinstance(directive, str):
+                    force_rows.append(row)
+                elif directive is not None:
+                    rows_by_ids.setdefault(directive, []).append(row)
+        return self._apply_masks(logits, rows_by_ids, force_rows)
+
+    def apply(
+        self, logits: torch.Tensor, ctx: LogitsContext | None = None
+    ) -> torch.Tensor:
         """Batched masking: group rows sharing a forbidden set, mask once.
 
         The base ``AdapterLogitsProcessor.apply`` invokes the per-request
@@ -884,6 +958,8 @@ class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
         kernels per step regardless of batch size. The per-row result is
         bit-identical to the base implementation.
         """
+        if ctx is not None:
+            return self._apply_v2(logits, ctx)
         if not self.req_info:
             return logits
         rows_by_ids: dict[tuple[int, ...], list[int]] = {}
@@ -907,6 +983,14 @@ class SolarOpen2TemplateLogitsProcessor(AdapterLogitsProcessor):
                 new_logits = req_lp(req_logits)
                 if new_logits is not req_logits:
                     logits[req_idx] = new_logits
+        return self._apply_masks(logits, rows_by_ids, force_rows)
+
+    def _apply_masks(
+        self,
+        logits: torch.Tensor,
+        rows_by_ids: dict[tuple[int, ...], list[int]],
+        force_rows: list[int],
+    ) -> torch.Tensor:
         vocab_size = logits.shape[-1]
         device = logits.device
         for forbidden_ids, rows in rows_by_ids.items():
