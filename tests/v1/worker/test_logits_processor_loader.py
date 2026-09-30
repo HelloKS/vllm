@@ -70,6 +70,21 @@ class ProcSource(Enum):
     ENTRYPOINT = auto()
 
 
+def test_solar_open2_loads_with_both_runner_interfaces():
+    from vllm.v1.sample.logits_processor import _load_logitsprocs_by_fqcns
+    from vllm.v1.sample.logits_processor.solar_open2 import (
+        SolarOpen2TemplateLogitsProcessor,
+    )
+
+    fqcn = (
+        "vllm.v1.sample.logits_processor.solar_open2:SolarOpen2TemplateLogitsProcessor"
+    )
+    assert _load_logitsprocs_by_fqcns([fqcn]) == [SolarOpen2TemplateLogitsProcessor]
+    assert loader._load_v2_logitsprocs_by_fqcns([fqcn]) == [
+        SolarOpen2TemplateLogitsProcessor
+    ]
+
+
 @pytest.mark.parametrize("source", list(ProcSource))
 def test_loads_v2_processors(monkeypatch: pytest.MonkeyPatch, source: ProcSource):
     """A V2 subclass loads via class object, FQCN string, or entrypoint."""
