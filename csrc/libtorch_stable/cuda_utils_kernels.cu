@@ -5,18 +5,14 @@
 #endif
 
 int64_t get_device_attribute(int64_t attribute, int64_t device_id) {
-  // Return the cached value on subsequent calls
-  static int value = [=]() {
-    int device = static_cast<int>(device_id);
-    if (device < 0) {
-      CUDA_CHECK(cudaGetDevice(&device));
-    }
-    int value;
-    CUDA_CHECK(cudaDeviceGetAttribute(
-        &value, static_cast<cudaDeviceAttr>(attribute), device));
-    return static_cast<int>(value);
-  }();
-
+  // Both the attribute and the device can change between calls.
+  int device = static_cast<int>(device_id);
+  if (device < 0) {
+    CUDA_CHECK(cudaGetDevice(&device));
+  }
+  int value;
+  CUDA_CHECK(cudaDeviceGetAttribute(
+      &value, static_cast<cudaDeviceAttr>(attribute), device));
   return value;
 }
 

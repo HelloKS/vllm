@@ -34,9 +34,17 @@ def format_gib(b: int) -> str:
 @cache
 def get_max_shared_memory_bytes(gpu: int = 0) -> int:
     """Returns the maximum shared memory per thread block in bytes."""
-    from vllm import _custom_ops as ops
+    if current_platform.is_cuda():
+        # Older native extensions cached one value across all CUDA attributes.
+        # Query PyTorch's per-device properties so these extensions cannot
+        # return a previously queried SM count as a shared-memory byte limit.
+        max_shared_mem = torch.cuda.get_device_properties(
+            gpu
+        ).shared_memory_per_block_optin
+    else:
+        from vllm import _custom_ops as ops
 
-    max_shared_mem = ops.get_max_shared_memory_per_block_device_attribute(gpu)
+        max_shared_mem = ops.get_max_shared_memory_per_block_device_attribute(gpu)
     # value 0 will cause MAX_SEQ_LEN become negative and test_attention.py
     # will fail
     assert max_shared_mem > 0, "max_shared_mem cannot be zero"
