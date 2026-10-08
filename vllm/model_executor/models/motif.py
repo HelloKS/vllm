@@ -36,6 +36,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.motif_weight_utils import load_motif_kv_b_shard
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.motif import MotifConfig
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -669,8 +670,25 @@ class MotifGDLAttention(nn.Module):
             # default FA backend assumes K=V dim, which mis-reshapes the cache.
             # mimo_v2_flash.py uses the same pattern.
             if self.v_head_dim != self.head_dim:
-                FlashAttentionDiffKVBackend.set_head_size_v(self.v_head_dim)
-                attn_backend = FlashAttentionDiffKVBackend
+                from vllm.platforms import current_platform
+
+                if current_platform.is_device_capability_family(120):
+                    from vllm.v1.attention.backends.triton_diffkv import (
+                        TritonDiffKVBackend,
+                    )
+
+                    attn_backend = TritonDiffKVBackend
+                elif FlashAttentionDiffKVBackend.is_supported_on_current_device(
+                    self.head_dim, self.v_head_dim, has_sinks=False
+                ):
+                    FlashAttentionDiffKVBackend.set_head_size_v(self.v_head_dim)
+                    attn_backend = FlashAttentionDiffKVBackend
+                else:
+                    from vllm.v1.attention.backends.triton_diffkv import (
+                        TritonDiffKVBackend,
+                    )
+
+                    attn_backend = TritonDiffKVBackend
             else:
                 attn_backend = None
 
@@ -1047,33 +1065,12 @@ class MotifMoEFused(nn.Module):
         # DeepGEMM) since they share the same parameter. None = no clamp.
         self.bias_clamp = getattr(config, "polynorm_bias_clamp", None)
 
-        # MXFP8 auto-conversion: pass quant_config=None to SharedFusedMoE so
-        # UnquantizedFusedMoEMethod allocates bf16 weights for the standard
-        # loader; MotifMxfp8MoEMethod (installed below) quantizes them in-place
-        # to MXFP8 in process_weights_after_loading. Shared experts + linears
-        # stay bf16 (the linear MXFP8 path needs a serialized checkpoint).
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptBlockFp8Config,
-            ModelOptMxFp8Config,
-            ModelOptNvFp4DynamicConfig,
-        )
+        from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
 
-        # ModelOptBlockFp8Config / ModelOptNvFp4DynamicConfig subclass
-        # ModelOptMxFp8Config, so _is_mxfp8 is True for all three — that gates
-        # the shared "load bf16, quantize at load" path (correct for all).
-        # _is_blockfp8 / _is_nvfp4 then pick the DeepGEMM 1x128 / CUTLASS NVFP4
-        # method over the CUTLASS MXFP8 one.
-        self._is_mxfp8 = isinstance(quant_config, ModelOptMxFp8Config)
-        self._is_blockfp8 = isinstance(quant_config, ModelOptBlockFp8Config)
-        self._is_nvfp4 = isinstance(quant_config, ModelOptNvFp4DynamicConfig)
-        # Direct load: the checkpoint already carries packed NVFP4 expert
-        # tensors (tools/motif_nvfp4_quantize_ckpt.py); skip load-time
-        # quantization and load them as-is.
-        self._nvfp4_direct = self._is_nvfp4 and getattr(
-            quant_config, "direct_load", False
+        # Motif's ModelOpt expert-only formats keep shared experts in BF16.
+        shared_quant_config = (
+            None if isinstance(quant_config, ModelOptMxFp8Config) else quant_config
         )
-        experts_quant_config = None if self._is_mxfp8 else quant_config
-        shared_quant_config = None if self._is_mxfp8 else quant_config
 
         # Capture the user-requested EP mode before any internal toggling.
         from vllm.config import get_current_vllm_config
@@ -1148,6 +1145,10 @@ class MotifMoEFused(nn.Module):
         # collective-communication semantics.
         if self._use_identity_allreduce:
             _vllm_config.parallel_config.enable_expert_parallel = True
+        from vllm.model_executor.layers.fused_moe.motif_routed_experts import (
+            MotifRoutedExperts,
+        )
+
         try:
             self.experts = SharedFusedMoE(
                 shared_experts=self.shared_experts,
@@ -1160,103 +1161,21 @@ class MotifMoEFused(nn.Module):
                 routed_scaling_factor=config.route_scale,
                 e_score_correction_bias=self.gate.e_score_correction_bias,
                 router_logits_dtype=torch.float32,
-                quant_config=experts_quant_config,
+                quant_config=quant_config,
+                routed_experts_cls=MotifRoutedExperts,
+                routed_experts_args=dict(
+                    hidden_clamp=self.hidden_clamp,
+                    polynorm_output_scale=polynorm_output_scale,
+                    polynorm_sigmoid_weight=polynorm_sigmoid_weight,
+                    use_identity_allreduce=self._use_identity_allreduce,
+                ),
                 prefix=f"{prefix}.experts",
                 apply_router_weight_on_input=False,
-                activation="silu",  # placeholder; MotifMoEMethod replaces activation
+                activation="silu",  # gated layout; the Motif method executes PolyNorm
             )
         finally:
             if self._use_identity_allreduce:
                 _vllm_config.parallel_config.enable_expert_parallel = _user_enable_ep
-
-        # Per-expert PolyNorm parameters live on the FusedMoE layer; they are
-        # sliced into local-experts via custom load_weights logic.
-        # v0.26: SharedFusedMoE is a factory returning MoERunner; the
-        # weight-carrying layer (quant method, expert params) is its
-        # routed_experts child. All uses below are __init__-local.
-        _experts = self.experts.routed_experts
-        local_E = _experts.local_num_experts
-        _experts.act_fn_weight = nn.Parameter(
-            torch.empty(local_E, 3, dtype=torch.float32)
-        )
-        _experts.act_fn_bias = nn.Parameter(
-            torch.empty(local_E, 1, dtype=torch.float32)
-        )
-
-        # Replace the default method before weights are processed so every
-        # backend uses PolyNorm between the expert GEMMs.
-        # --quantization modelopt_blockfp8 selects the block-wise FP8 (128x128
-        # weight / 1x128 activation) DeepGEMM grouped-GEMM path on SM90 and
-        # SM100 alike (falls back to vllm.third_party.deep_gemm when the
-        # standalone deep_gemm package is absent). modelopt_mxfp8 keeps the
-        # original CUTLASS MXFP8 (1x32) logic.
-        if self._is_nvfp4:
-            # --quantization modelopt_nvfp4 selects the CUTLASS NVFP4 path
-            # (E2M1 + 1x16 E4M3 blockscale, SM100+ only).
-            from vllm.model_executor.layers.fused_moe.motif_nvfp4_experts import (
-                MotifNvfp4MoEMethod,
-            )
-
-            motif_method = MotifNvfp4MoEMethod(
-                moe=_experts.moe_config,
-                poly_norm_weight=_experts.act_fn_weight,
-                poly_norm_bias=_experts.act_fn_bias,
-                hidden_clamp=self.hidden_clamp,
-                polynorm_output_scale=polynorm_output_scale,
-                polynorm_sigmoid_weight=polynorm_sigmoid_weight,
-                use_identity_allreduce=self._use_identity_allreduce,
-                direct_load=self._nvfp4_direct,
-            )
-            if self._nvfp4_direct:
-                motif_method.convert_layer_for_direct_load(_experts)
-        elif self._is_blockfp8:
-            # DeepGEMM 1x128 grouped GEMM — the only block-FP8 path
-            # (SM90 and SM100; validated on H200, PR #63).
-            from vllm.model_executor.layers.fused_moe.motif_deepgemm_experts import (  # noqa: E501
-                MotifDeepGemmMoEMethod as _blockfp8_method_cls,
-            )
-
-            logger.info(
-                "modelopt_blockfp8 MoE method: {}", _blockfp8_method_cls.__name__
-            )
-            motif_method = _blockfp8_method_cls(
-                moe=_experts.moe_config,
-                poly_norm_weight=_experts.act_fn_weight,
-                poly_norm_bias=_experts.act_fn_bias,
-                hidden_clamp=self.hidden_clamp,
-                polynorm_output_scale=polynorm_output_scale,
-                polynorm_sigmoid_weight=polynorm_sigmoid_weight,
-                use_identity_allreduce=self._use_identity_allreduce,
-            )
-        elif self._is_mxfp8:
-            from vllm.model_executor.layers.fused_moe.motif_mxfp8_experts import (
-                MotifMxfp8MoEMethod,
-            )
-
-            motif_method = MotifMxfp8MoEMethod(
-                moe=_experts.moe_config,
-                poly_norm_weight=_experts.act_fn_weight,
-                poly_norm_bias=_experts.act_fn_bias,
-                hidden_clamp=self.hidden_clamp,
-                polynorm_output_scale=polynorm_output_scale,
-                polynorm_sigmoid_weight=polynorm_sigmoid_weight,
-                use_identity_allreduce=self._use_identity_allreduce,
-            )
-        else:
-            from vllm.model_executor.layers.fused_moe.motif_experts import (
-                MotifMoEMethod,
-            )
-
-            motif_method = MotifMoEMethod(
-                moe=_experts.moe_config,
-                poly_norm_weight=_experts.act_fn_weight,
-                poly_norm_bias=_experts.act_fn_bias,
-                hidden_clamp=self.hidden_clamp,
-                polynorm_output_scale=polynorm_output_scale,
-                polynorm_sigmoid_weight=polynorm_sigmoid_weight,
-                use_identity_allreduce=self._use_identity_allreduce,
-            )
-        _experts._replace_quant_method(motif_method)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Mirrors deepseek_v2: only the internal-router path may use
@@ -1810,6 +1729,61 @@ class MotifForCausalLM(nn.Module, SupportsPP):
                     return params_dict[alt], alt
             return param, target
 
+        # Serialized AWQ/GPTQ/FP8 exports may split experts and gate/up projections.
+        import regex as re
+
+        match = re.search(
+            r"moe\.experts\.(?:(\d+)\.)?(gate_up_proj|gate_proj|up_proj|down_proj)"
+            r"\.(qweight|qzeros|scales|weight_scale_inv|weight_scale|weight)$",
+            name,
+        )
+        if match is not None:
+            expert, projection, suffix = match.groups()
+            prefix = "w2" if projection == "down_proj" else "w13"
+            suffix = "weight_scale" if suffix == "weight_scale_inv" else suffix
+            stem = name[: match.start()] + "moe.experts."
+            param, target = _resolve_expert_param(stem + prefix + "_" + suffix)
+            if param is None:
+                raise ValueError(f"Unsupported serialized Motif expert tensor: {name}")
+            if loaded_weight.dtype != param.dtype and suffix in ("weight", "qweight"):
+                raise ValueError(
+                    f"{name}: checkpoint dtype does not match {param.dtype}"
+                )
+            entries = (
+                [(int(expert), loaded_weight)]
+                if expert is not None
+                else enumerate(loaded_weight)
+            )
+            for ge, tensor in entries:
+                if projection == "gate_up_proj":
+                    axis = 1 if getattr(param, "is_transposed", False) else 0
+                    gate, up = tensor.chunk(2, dim=axis)
+                    param.weight_loader(param, gate, target, "w1", ge)
+                    param.weight_loader(param, up, target, "w3", ge)
+                else:
+                    shard = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}[
+                        projection
+                    ]
+                    param.weight_loader(param, tensor, target, shard, ge)
+            loaded_params.add(target)
+            return True
+
+        stream_loader = getattr(routed.quant_method, "load_expert_tensor", None)
+        if stream_loader is not None:
+            for ckpt_suffix, param_name in (
+                ("moe.experts.gate_up_proj", "w13_weight"),
+                ("moe.experts.down_proj", "w2_weight"),
+            ):
+                if name.endswith(ckpt_suffix) and stream_loader(
+                    routed, param_name, loaded_weight
+                ):
+                    stem = name[: -len(ckpt_suffix)] + "moe.experts."
+                    for suffix in ("", "_scale", "_scale_2"):
+                        _, target = _resolve_expert_param(stem + param_name + suffix)
+                        if target in params_dict:
+                            loaded_params.add(target)
+                    return True
+
         # NVFP4 direct load (tools/motif_nvfp4_quantize_ckpt.py): per-expert
         # global scales [E] fp32. Custom expert_map slicing — FusedMoE's
         # per-tensor scale loader expects a different param layout. Checked
@@ -2096,34 +2070,13 @@ class MotifForCausalLM(nn.Module, SupportsPP):
             if name not in params_dict:
                 continue
 
-            # MLA layers size kv_b_proj as [num_heads*(P+V), Lkv] so the MLA
-            # backend can absorb W_UK/W_UV per query head, but checkpoints store
-            # the GQA shape [num_kv_heads*(P+V), Lkv]. Replicate each kv-head
-            # block group_size=num_heads/num_kv_heads times so query heads in the
-            # same GQA group share the same materialized K/V (mathematically
-            # equivalent to GQA). SWA-mode layers keep the original shape.
-            if name.endswith(".self_attn.kv_b_proj.weight"):
-                attn_module = None
-                try:
-                    layer_idx = extract_layer_index(name)
-                    attn_module = self.model.layers[layer_idx].self_attn
-                except (AssertionError, IndexError, AttributeError):
-                    pass
-                if (
-                    attn_module is not None
-                    and getattr(attn_module, "is_mla_layer", False)
-                    and attn_module.num_heads != attn_module.num_kv_heads
+            if ".self_attn.kv_b_proj." in name:
+                attn_module = self.model.layers[extract_layer_index(name)].self_attn
+                if attn_module.is_mla_layer and load_motif_kv_b_shard(
+                    params_dict[name], loaded_weight, attn_module
                 ):
-                    num_kv = attn_module.num_kv_heads
-                    num_q = attn_module.num_heads
-                    kv_dim = attn_module.qk_nope_head_dim + attn_module.v_head_dim
-                    if loaded_weight.shape[0] == num_kv * kv_dim:
-                        group_size = num_q // num_kv
-                        loaded_weight = (
-                            loaded_weight.view(num_kv, kv_dim, -1)
-                            .repeat_interleave(group_size, dim=0)
-                            .reshape(num_q * kv_dim, -1)
-                        )
+                    loaded_params.add(name)
+                    continue
 
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)

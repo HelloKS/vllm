@@ -75,7 +75,6 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     swizzle_blockscale,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
-from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -332,22 +331,24 @@ def _quantize_experts_to_nvfp4(
         f"K={K} must give 4-aligned scale columns for the NVFP4 sf layout"
     )
 
-    amax = weight.abs().amax(dim=(1, 2)).to(torch.float32).clamp(min=1e-12)
-    global_scales = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax  # [E]
-
-    q_list = []
-    sf_list = []
+    weight_fp4 = torch.empty(E, X, K // 2, dtype=torch.uint8, device=weight.device)
+    weight_scale = torch.empty(
+        E,
+        X,
+        K // NVFP4_BLOCK_SIZE,
+        dtype=torch.float8_e4m3fn,
+        device=weight.device,
+    )
+    alphas = torch.empty(E, dtype=torch.float32, device=weight.device)
     for e in range(E):
+        amax = weight[e].abs().amax().float().clamp(min=1e-12)
+        global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax
         q, sf = ops.scaled_fp4_quant(
-            weight[e], global_scales[e], is_sf_swizzled_layout=False
+            weight[e], global_scale, is_sf_swizzled_layout=True
         )
-        q_list.append(q)
-        sf_list.append(sf)
-    weight_fp4 = torch.stack(q_list)  # [E, X, K//2] uint8
-    # [E, X, K//16] e4m3 (flat) -> CUTLASS 128x4 swizzled layout.
-    weight_scale = swizzle_blockscale(torch.stack(sf_list))
-
-    alphas = (1.0 / global_scales).to(torch.float32)
+        weight_fp4[e].copy_(q)
+        weight_scale[e].copy_(sf.reshape(X, K // NVFP4_BLOCK_SIZE))
+        alphas[e] = 1.0 / global_scale
     return weight_fp4, weight_scale, alphas
 
 
@@ -497,8 +498,9 @@ class MotifNvfp4Experts(_MotifPolyNormExpertsBase):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return current_platform.is_cuda() and current_platform.has_device_capability(
-            100
+        return current_platform.is_cuda() and (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
         )
 
     def workspace_shapes(
@@ -563,9 +565,14 @@ class MotifNvfp4Experts(_MotifPolyNormExpertsBase):
         # small-sort and general routes, acceptance holds at 96-100% under
         # load, and AA-Omniscience metric is 0.4996 vs 0.4857 unfused.
         # Opt out with VLLM_MOTIF_NVFP4_FUSED=0.
-        if self._calib_amax is None and os.environ.get(_FUSED_ENV, "1").lower() in (
-            "1",
-            "true",
+        if (
+            current_platform.is_device_capability_family(100)
+            and self._calib_amax is None
+            and os.environ.get(_FUSED_ENV, "1").lower()
+            in (
+                "1",
+                "true",
+            )
         ):
             self._apply_fused(
                 output,
@@ -1017,31 +1024,11 @@ class MotifNvfp4Experts(_MotifPolyNormExpertsBase):
 
 
 class MotifNvfp4MoEMethod(_MotifPolyNormMoEMethodBase):
-    """MoE method for NVFP4 experts: dynamic (bf16->NVFP4) or direct load.
+    """Packed NVFP4 experts, allocated before loading on SM100/SM120.
 
-    Dynamic mode (``direct_load=False``): enabled via ``--quantization
-    modelopt_nvfp4`` against a bf16 checkpoint; ``MotifMoEFused`` installs
-    this on SM100+. ``SharedFusedMoE`` is constructed with
-    ``quant_config=None`` so the upstream method allocates bf16 weights from
-    the checkpoint; ``process_weights_after_loading`` then in-place quantizes
-    them to NVFP4 (packed E2M1 + swizzled E4M3 blockscales + per-expert
-    alphas).
-
-    Direct mode (``direct_load=True``): the checkpoint already carries the
-    NVFP4 tensors (written by ``tools/motif_nvfp4_quantize_ckpt.py``).
-    ``convert_layer_for_direct_load`` swaps the bf16 parameters for packed
-    uint8 weights, linear E4M3 blockscale and per-expert ``weight_scale_2``
-    parameters before loading; ``process_weights_after_loading`` validates,
-    swizzles the blockscales and folds the epilogue alphas — no quantization
-    compute at load.
-
-    In both modes routed experts are the only quantized layers — shared
-    experts and dense linears stay bf16.
-
-    ``super().process_weights_after_loading`` is intentionally skipped — it
-    runs the unquantized kernel's ``_setup_kernel`` which under
-    ``VLLM_USE_FLASHINFER_MOE_FP16=1`` swaps w13->w31 and breaks gate/up
-    split.
+    Serialized checkpoints copy packed weights and linear blockscales directly.
+    Dynamic loading quantizes rank-local experts into the same final allocation.
+    The SM120 family uses separate PolyNorm and activation quantization kernels.
     """
 
     def __init__(self, *, direct_load: bool = False, **kwargs):
@@ -1052,73 +1039,68 @@ class MotifNvfp4MoEMethod(_MotifPolyNormMoEMethodBase):
     def supports_eplb(self) -> bool:
         return False
 
-    def convert_layer_for_direct_load(self, layer: nn.Module) -> None:
-        """Re-register expert params to receive pre-quantized NVFP4 tensors.
-
-        Replaces the bf16 ``w13_weight`` / ``w2_weight`` allocated by the
-        unquantized method with packed uint8 params of shape ``[E, X, K/2]``
-        and registers ``*_weight_scale`` (linear-layout E4M3, ``[E, X, K/16]``,
-        loaded through FusedMoE's BLOCK group-scale path) and
-        ``*_weight_scale_2`` (fp32 ``[E]``, loaded by motif.py with the
-        expert map). Must run after the FusedMoE is constructed and before
-        weights load.
-        """
+    def create_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
         from vllm.model_executor.layers.fused_moe.routed_experts import (
             FusedMoeWeightScaleSupported,
         )
+        from vllm.model_executor.models.motif_weight_utils import (
+            allocate_nvfp4_expert_tensors,
+        )
         from vllm.model_executor.utils import set_weight_attrs
 
-        assert self.direct_load
-        for wname in ("w13_weight", "w2_weight"):
-            old = getattr(layer, wname)
-            E, X, K = old.shape
-            assert K % (2 * NVFP4_BLOCK_SIZE) == 0, (
-                f"{wname}: K={K} must be divisible by {2 * NVFP4_BLOCK_SIZE} "
-                "for NVFP4 packing"
-            )
-            # Same layout constraints as _quantize_experts_to_nvfp4 (the
-            # swizzle assumes no padding for motif dims).
-            assert X % 128 == 0, f"{wname}: X={X} must be 128-aligned"
-            assert (K // NVFP4_BLOCK_SIZE) % 4 == 0, (
-                f"{wname}: K={K} must give 4-aligned scale columns"
-            )
-            weight_loader = old.weight_loader
-
-            packed = nn.Parameter(
-                torch.empty(E, X, K // 2, dtype=torch.uint8, device=old.device),
-                requires_grad=False,
-            )
-            set_weight_attrs(packed, {"weight_loader": weight_loader})
-            layer.register_parameter(wname, packed)
-
-            scale = nn.Parameter(
-                torch.empty(
-                    E,
-                    X,
-                    K // NVFP4_BLOCK_SIZE,
-                    dtype=torch.float8_e4m3fn,
-                    device=old.device,
-                ),
-                requires_grad=False,
-            )
-            set_weight_attrs(
-                scale,
-                {
-                    "weight_loader": weight_loader,
-                    "quant_method": FusedMoeWeightScaleSupported.BLOCK.value,
-                },
-            )
-            layer.register_parameter(wname + "_scale", scale)
-
-            scale_2 = nn.Parameter(
-                torch.empty(E, dtype=torch.float32, device=old.device),
-                requires_grad=False,
-            )
-            layer.register_parameter(wname + "_scale_2", scale_2)
-        logger.info_once(
-            "NVFP4 direct load: expecting pre-quantized expert weights "
-            "(packed E2M1 + E4M3 blockscales + weight_scale_2)"
+        if (
+            current_platform.is_device_capability_family(120)
+            and params_dtype != torch.bfloat16
+        ):
+            raise ValueError("SM120 Motif NVFP4 grouped GEMM requires --dtype bfloat16")
+        tensors = allocate_nvfp4_expert_tensors(
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
         )
+        for name, tensor in tensors.items():
+            param = nn.Parameter(tensor, requires_grad=False)
+            attrs = dict(extra_weight_attrs)
+            if name.endswith("_scale"):
+                attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
+            set_weight_attrs(param, attrs)
+            layer.register_parameter(name, param)
+
+    def load_expert_tensor(self, layer, wname, weight):
+        """Quantize only rank-local experts; never stage a BF16 MoE layer."""
+        if self.direct_load:
+            return False
+        if weight.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError("Dynamic Motif NVFP4 requires BF16/FP16 expert weights")
+        dst = getattr(layer, wname)
+        sf = getattr(layer, wname + "_scale")
+        alpha = getattr(layer, wname + "_scale_2")
+        mapping = layer._expert_map
+        local_ids = (
+            mapping.tolist() if mapping is not None else list(range(weight.shape[0]))
+        )
+        if len(local_ids) != weight.shape[0]:
+            raise ValueError("Checkpoint expert count does not match the expert map")
+        for ge, le in enumerate(local_ids):
+            if le < 0:
+                continue
+            if weight[ge].numel() * weight.element_size() > 128 * 1024**2:
+                raise ValueError("Motif expert exceeds the 128 MiB staging budget")
+            source = weight[ge].to(device=dst.device)
+            q, scales, scale_2 = _quantize_experts_to_nvfp4(source.unsqueeze(0))
+            dst.data[le].copy_(q[0])
+            sf.data[le].copy_(scales[0])
+            alpha.data[le].copy_(scale_2[0])
+            del source, q, scales, scale_2
+        return True
 
     def _finalize_direct_loaded_weights(
         self, layer: nn.Module
@@ -1145,52 +1127,31 @@ class MotifNvfp4MoEMethod(_MotifPolyNormMoEMethodBase):
                 f"{wname}_scale_2 must be positive finite — the checkpoint "
                 "is missing the per-expert NVFP4 global scales"
             )
-            # An all-zero blockscale row means the expert never loaded.
-            assert bool(
-                (s.data.view(s.shape[0], -1).to(torch.float32).abs().sum(1) > 0).all()
-            ), f"{wname}_scale has all-zero experts — incomplete checkpoint?"
-
-            replace_parameter(layer, wname + "_scale", swizzle_blockscale(s.data))
+            # Bound validation/swizzling temporaries to one expert.
+            for e in range(s.shape[0]):
+                values = s.data[e].float()
+                if not bool(torch.isfinite(values).all()):
+                    raise ValueError(f"{wname}_scale: missing or invalid expert {e}")
+                del values
+                if self.direct_load:
+                    s.data[e : e + 1].copy_(swizzle_blockscale(s.data[e : e + 1]))
         return layer.w13_weight_scale_2.data, layer.w2_weight_scale_2.data
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if not (
-            current_platform.is_cuda() and current_platform.has_device_capability(100)
+            current_platform.is_cuda()
+            and (
+                current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(120)
+            )
         ):
             raise RuntimeError(
-                "MotifNvfp4MoEMethod requires SM100 (Blackwell) or newer."
+                "Motif NVFP4 requires a compiled SM100 or SM120-family kernel."
             )
 
-        if self.direct_load:
-            # Pure weight alphas (== weight_scale_2); a_gscale folded below.
-            w13_alpha_w, w2_alpha_w = self._finalize_direct_loaded_weights(layer)
-            E_local = layer.w13_weight.shape[0]
-            device = layer.w13_weight.device
-        else:
-            w13 = layer.w13_weight.data  # [E_local, 2*I, K] bf16
-            w2 = layer.w2_weight.data  # [E_local, K, I]   bf16
-            assert w13.dtype in (torch.bfloat16, torch.float16), (
-                f"expected bf16/fp16 w13 at load time, got {w13.dtype} — a "
-                "pre-quantized NVFP4 checkpoint requires the direct-load "
-                "config (its config.json quantization_config selects it "
-                "automatically)"
-            )
-            # Pure weight alphas (1 / w_gscale); a_gscale is folded in below.
-            w13_fp4, w13_scale, w13_alpha_w = _quantize_experts_to_nvfp4(w13)
-            w2_fp4, w2_scale, w2_alpha_w = _quantize_experts_to_nvfp4(w2)
-            E_local = w13.shape[0]
-            device = w13_fp4.device
-
-            replace_parameter(layer, "w13_weight", w13_fp4)
-            replace_parameter(layer, "w2_weight", w2_fp4)
-            layer.register_parameter(
-                "w13_weight_scale",
-                nn.Parameter(w13_scale, requires_grad=False),
-            )
-            layer.register_parameter(
-                "w2_weight_scale",
-                nn.Parameter(w2_scale, requires_grad=False),
-            )
+        w13_alpha_w, w2_alpha_w = self._finalize_direct_loaded_weights(layer)
+        E_local = layer.w13_weight.shape[0]
+        device = layer.w13_weight.device
 
         # Activation global scales: calibrated sidecar (per-GLOBAL expert,
         # sliced to this rank's locals) if present, else 1.0. a_gscale == 1.0

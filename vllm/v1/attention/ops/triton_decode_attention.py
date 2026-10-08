@@ -503,7 +503,8 @@ def _decode_grouped_att_m_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     BLOCK = 32
-    if is_hip_:
+    small_smem_mla = is_mla and current_platform.is_device_capability_family(120)
+    if is_hip_ or small_smem_mla:
         BLOCK = 16
 
     batch, head_num = q.shape[0], q.shape[1]
@@ -518,7 +519,7 @@ def _decode_grouped_att_m_fwd(
     )
 
     extra_kargs = {}
-    num_stages = 2
+    num_stages = 1 if small_smem_mla else 2
     if is_hip_:
         # https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html#mi300x-triton-kernel-performance-optimization
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py

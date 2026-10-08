@@ -67,6 +67,13 @@ def _get_mla_prefill_backend_priorities(
             MLAPrefillBackendEnum.FLASH_ATTN,
         ]
 
+    if device_capability.major == 12 and mla_dimensions == MLADimensions(
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+    ):
+        return [MLAPrefillBackendEnum.MOTIF_TRITON]
+
     if device_capability.major == 10:  # Blackwell
         if mla_dimensions == MLADimensions(
             qk_nope_head_dim=192,

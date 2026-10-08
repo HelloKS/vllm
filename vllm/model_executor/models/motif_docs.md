@@ -28,7 +28,7 @@ vllm serve Motif-Technologies/Motif-3 \
 Adjust the parallelism and context length to the available memory. Optional
 flags are `--quantization modelopt_mxfp8`, `--quantization modelopt_blockfp8`,
 or `--quantization modelopt_nvfp4`. NVFP4 requires compatible Blackwell hardware.
-The block-FP8 path requires DeepGEMM. To enable MTP, add
+The block-FP8 expert path uses Triton; MXFP8 experts use Marlin. To enable MTP, add
 `--speculative-config '{"method":"mtp","num_speculative_tokens":1}'`.
 
 ### Port validation
@@ -51,9 +51,110 @@ production use, run the following on the Linux GPU build and evaluate the model:
   tests/v1/sample/test_repetition_guard.py \
   tests/transformers_utils/test_config.py::test_motif_config_loads_without_remote_code
 .venv/bin/python -m pytest tests/kernels/moe/test_motif_nvfp4.py
+.venv/bin/python -m pytest tests/model_executor/test_motif_weight_loading.py \
+  tests/kernels/attention/test_motif_attention.py \
+  tests/kernels/moe/test_motif_quantized_experts.py
 .venv/bin/python -m pytest tests/kernels/mhc/test_mhc_kernels.py -k motif
 ```
 
+### GB10 implementation and validation plan
+
+The target is two 128 GB GB10 systems, TP=2, with a 262144-token context.
+The baseline is [Motif-3-NVFP4](https://huggingface.co/Motif-Technologies/Motif-3-NVFP4).
+This target has **not been validated on GB10**. The changes below implement the
+revised plan; GPU compilation, correctness, memory measurements and model
+evaluation remain acceptance requirements.
+
+Local validation of this revision: 144 CPU tests passed and 17 CUDA tests were
+skipped. Ruff, Python AST checks, clang-format, Markdown lint, SPDX/import/API
+checks and the test-tethering check passed. The full pre-commit runner could not
+provision an unrelated hook environment under the Windows sandbox, so these
+checks were run individually. No CUDA build or GB10 model run is implied.
+
+The previously reported failure used the NVFP4 checkpoint with kernel capability
+guards removed. That is not the execution path here. Its exact failing kernel
+cannot be identified without the original traceback. FlashInfer TRT-LLM attention
+and TRT-LLM MoE are separate paths, and passing a capability guard does not make
+their tile sizes or shared-memory requirements valid on GB10.
+
+| Component | Implemented path | Verification required on GB10 |
+| --- | --- | --- |
+| NVFP4 expert storage | Allocate packed weights and scales directly before checkpoint loading | Peak CUDA allocation, RSS and system memory availability |
+| NVFP4 GEMMs | Existing native CUTLASS SM120-family grouped GEMM; check compiled shared storage against the device opt-in limit before initialization | Build for the target device, then both expert GEMMs |
+| NVFP4 activation preparation | Unfused SM12 path; retain the SM100 restriction on Motif's fused gather/PolyNorm quantization kernels | Compare against NVFP4 reference, including expert routing |
+| GDLA sliding-window attention | Triton DiffKV, QK=192/V=128, 16x32 tiles, one stage | Window boundary, paged cache, prefix cache, graph replay |
+| Full MLA prefill | Triton DiffKV with ragged sequences and context-chunk LSE | Chunk merge, empty context, long-context generation |
+| Full MLA decode | Existing Triton MLA with 16-token tiles and one stage on SM12 | Decode and MTP multi-token queries |
+| Block FP8 experts | E4M3 weights, 128x128 FP32 scales, Triton W8A8 with PolyNorm | Quantized outputs and model evaluation |
+| MXFP8 experts | E4M3/E8M0 checkpoint storage, per-expert Marlin repack, W8A16 with PolyNorm | Quantized outputs and model evaluation |
+| INT4 experts | AWQ or symmetric GPTQ, Marlin W4A16 with PolyNorm | Compatible serialized checkpoint, conversion, outputs and model evaluation |
+
+All these expert paths select the Motif method before allocating weights. The
+old NVFP4 direct-load path first allocated BF16 experts and then replaced them
+with packed weights. It did not need to dequantize the entire NVFP4 checkpoint;
+the temporary BF16 allocation and scale-processing copies caused avoidable peaks.
+For 192 local experts, H=4096 and I=1280, the old BF16 allocation was 5.625 GiB
+per MoE layer. Packed NVFP4 weights plus scales occupy about 1.582 GiB instead.
+These are allocation calculations, not measured process peaks.
+
+Scale validation/swizzling now operates one expert at a time. Dynamic NVFP4
+loading stages only rank-local experts, with a 128 MiB per-expert staging limit;
+dynamic block FP8 and MXFP8 quantize 128 rows at a time. The source checkpoint
+tensor can still be memory-mapped in host memory. INT4 conversion uses the
+upstream layer-level Marlin repacker and can still allocate packed temporary
+copies. MLA KV projections are copied directly into the local query-head layout,
+avoiding expansion to all global query heads first. MTP uses the same expert
+loader as the main model.
+
+Set `VLLM_MOTIF_LOAD_PROFILE=1` to log allocation/ready stages with process RSS,
+system available memory, CUDA allocated/reserved memory and cumulative CUDA peak
+allocation. On GB10, RSS and CUDA accounting may overlap in unified memory;
+do not add those counters together. Sample system available memory throughout
+loading as well: the per-layer log alone cannot capture every transient peak.
+
+Supported alternative checkpoint contracts:
+
+- Dynamic FP8/NVFP4 accepts the original fused BF16/FP16 Motif expert tensors.
+  It never constructs a full BF16 expert parameter set before quantization.
+- Serialized block FP8 uses `quant_method=fp8`, `weight_block_size=[128,128]`,
+  E4M3 expert weights and FP32 block scales (`weight_scale` or
+  `weight_scale_inv`). Per-tensor FP8 is not supported by this Motif path.
+- Serialized MXFP8 uses the ModelOpt MXFP8 configuration and E4M3 weights with
+  E8M0 scales stored as uint8. Dynamic MXFP8 remains available through
+  `--quantization modelopt_mxfp8`.
+- INT4 accepts AWQ with zero points or symmetric GPTQ with `desc_act=False`,
+  4-bit weights and group sizes 32/64/128. Per-layer dynamic overrides are
+  rejected. Expert keys may use `experts.<id>.{gate_proj,up_proj,down_proj}`
+  or fused `experts.{gate_up_proj,down_proj}` followed by the quantized parameter
+  suffix. The exporter must preserve Motif's unquantized PolyNorm parameters.
+- Quantization of dense/shared/attention projections follows the respective
+  existing linear method. These expert additions do not provide a checkpoint
+  exporter, calibration workflow or CPU offloading. Full FP8-model testing
+  requires hardware with sufficient memory beyond the two-GB10 target.
+
+After building the native extensions on the Linux GPU hosts and configuring a
+two-node Ray cluster, start the NVFP4 acceptance run with:
+
+```bash
+VLLM_MOTIF_LOAD_PROFILE=1 vllm serve Motif-Technologies/Motif-3-NVFP4 \
+  --distributed-executor-backend ray \
+  --tensor-parallel-size 2 --dtype bfloat16 \
+  --max-model-len 262144 --max-num-seqs 1 \
+  --max-num-batched-tokens 512 --enable-chunked-prefill \
+  --block-size 128 --kv-cache-dtype bfloat16 --enforce-eager
+```
+
+Pin and record the checkpoint revision, vLLM revision, CUDA/PyTorch/FlashInfer
+versions, device compute capability and shared-memory limits. Run the kernel
+tests above first. Then test 8K, 32K, 128K and 256K total context, ending with a
+261120-token prompt plus 1024 generated tokens. Record peak memory, minimum
+system memory available, time to first token, decode throughput and finite logits.
+Target at least 8 GiB system memory headroom per node, but determine feasibility
+from measurements rather than treating `max-model-len` as a memory guarantee.
+Repeat with CUDA graphs, prefix caching and one-token MTP enabled individually,
+then together. Check mHC and PolyNorm against references and evaluate output
+quality against the baseline. FP8/INT4 kernel tests are only a prerequisite for
+full-model accuracy evaluation, not a replacement for it.
 
 ## Overview
 
@@ -63,7 +164,7 @@ Motif is a decoder-only language model combining three key architectural innovat
 2. **MHC** – Manifold-constrained Hyper-Connections (optional residual path)
 3. **Hybrid MoE** – Dense-first layers followed by interleaved MoE layers
 
-```
+```text
 input_ids [T]
     │
     ▼
@@ -84,7 +185,7 @@ RMSNorm → ParallelLMHead → logits [T, vocab_size]
 
 Each decoder layer is assigned one of two feed-forward types based on its index:
 
-```
+```text
 layer_idx < n_dense_first_layers          → always MotifMLP (dense)
 layer_idx >= n_dense_first_layers
     AND (layer_idx + 1) % interleave_moe_layer_step == 0  → MotifMoE
@@ -97,7 +198,7 @@ layer_idx >= n_dense_first_layers
 
 ### Standard Path (mhc_enabled=False)
 
-```
+```text
 hidden_states [T, H]
     │
     ├─ input_layernorm (RMSNorm, fused residual)
@@ -115,7 +216,7 @@ MotifMLP or MotifMoE → [T, H]
 
 The tensor lives as `[T, E, H]` throughout all layers. Each sublayer (attn, ffn) follows the same pattern:
 
-```
+```text
 x [1, T, E, H]
     │
     ▼  MotifMHCLayer
@@ -142,27 +243,28 @@ x_next = x_mixed + out_expanded  [1, T, E, H]
 ## MotifGDLAttention (GDLA)
 
 Grouped Differential Latent Attention combines:
+
 - **Low-rank latent compression** for Q and KV (like MLA)
 - **Differential noise cancellation** (like DIFF Transformer)
 - **RoPE** applied only over a subset of head dims (`qk_rope_head_dim`)
 
 ### Weight Naming: Checkpoint → vLLM
 
-| Checkpoint key      | vLLM name               | Type                  |
-|---------------------|-------------------------|-----------------------|
-| `wq_a`              | `q_a_proj`              | ReplicatedLinear      |
-| `q_norm`            | `q_a_layernorm`         | RMSNorm               |
-| `wq_b`              | `q_b_proj`              | ColumnParallelLinear  |
-| `wq_b_gate`         | `q_b_gate`              | ColumnParallelLinear  |
-| `wkv_a`             | `kv_a_proj_with_mqa`    | ReplicatedLinear      |
-| `kv_norm`           | `kv_a_layernorm`        | RMSNorm               |
-| `wkv_b`             | `kv_b_proj`             | ColumnParallelLinear  |
-| `lambda_proj`       | `lambda_proj`           | ColumnParallelLinear  |
-| `wo`                | `o_proj`                | RowParallelLinear     |
+| Checkpoint key | vLLM name | Type |
+| --- | --- | --- |
+| `wq_a` | `q_a_proj` | ReplicatedLinear |
+| `q_norm` | `q_a_layernorm` | RMSNorm |
+| `wq_b` | `q_b_proj` | ColumnParallelLinear |
+| `wq_b_gate` | `q_b_gate` | ColumnParallelLinear |
+| `wkv_a` | `kv_a_proj_with_mqa` | ReplicatedLinear |
+| `kv_norm` | `kv_a_layernorm` | RMSNorm |
+| `wkv_b` | `kv_b_proj` | ColumnParallelLinear |
+| `lambda_proj` | `lambda_proj` | ColumnParallelLinear |
+| `wo` | `o_proj` | RowParallelLinear |
 
 ### Forward Flow
 
-```
+```text
 hidden_states [T, H]
     │
     ├─── Q path ───────────────────────────────────────────────────────┐
@@ -203,6 +305,7 @@ hidden_states [T, H]
 ```
 
 **Key shapes:**
+
 - `num_heads = n_signal_heads + num_noise_heads`
 - `n_signal_heads = grouped_ratio * num_noise_heads`
 - `grouped_ratio = (num_heads - num_noise_heads) // num_noise_heads`
@@ -213,7 +316,7 @@ hidden_states [T, H]
 
 Used for the first `n_dense_first_layers` layers and as `shared_experts` inside MoE layers.
 
-```
+```text
 hidden_states [T, H]
     │
     ├─ gate_proj (ColumnParallel) → [T, I // tp_size]
@@ -230,7 +333,7 @@ down_proj (RowParallel, includes all-reduce) → [T, H]
 
 When `hidden_act = "poly_norm"`, each TP rank only sees `I // tp_size` of the intermediate dimension. The RMS normalization inside PolyNorm:
 
-```
+```text
 _norm(x) = x / sqrt(mean(x², dim=-1) + eps)
 ```
 
@@ -242,7 +345,7 @@ computes the mean over a **shard**, giving wrong statistics. Fix: `PolyNorm(tp_s
 
 ### Routing
 
-```
+```text
 hidden_states [T, H]
     │
     ▼
@@ -271,14 +374,14 @@ out [T, H]
 
 Each TP rank holds `num_experts // tp_size` complete experts (full `H` and `I` dimensions):
 
-```
+```text
 gate_up_proj: [local_E, 2*I, H]   ← full H, full I
 down_proj:    [local_E, H,   I]   ← full H, full I
 ```
 
 Hidden states are **replicated** — every rank receives the full `[T, H]` tensor.
 
-```
+```text
 hidden_states [T, H]  ← replicated on ALL ranks
     │
     ▼  gate+up GEMM (one big batched matmul)
@@ -307,23 +410,23 @@ Each expert operates on the **full** intermediate dimension `I` (not split by TP
 
 ### Comparison: PolyNorm TP Treatment
 
-| Layer                               | Intermediate sharding         | PolyNorm needs all-reduce? |
-|-------------------------------------|-------------------------------|----------------------------|
-| `MotifMLP` (dense, first N layers)  | `I // tp_size` (ColumnParallel) | **Yes** → `PolyNorm(tp_size)` |
-| `MotifMoEExperts`                   | full `I` per expert            | **No** → `GroupedPolyNorm` unchanged |
-| `MotifMoE.shared_experts` (MotifMLP)| `I // tp_size` (ColumnParallel) | **Yes** → via `MotifMLP` ✓ |
+| Layer | Intermediate sharding | PolyNorm needs all-reduce? |
+| --- | --- | --- |
+| `MotifMLP` (dense, first N layers) | `I // tp_size` (ColumnParallel) | **Yes** → `PolyNorm(tp_size)` |
+| `MotifMoEExperts` | full `I` per expert | **No** → `GroupedPolyNorm` unchanged |
+| `MotifMoE.shared_experts` (MotifMLP) | `I // tp_size` (ColumnParallel) | **Yes** → via `MotifMLP` ✓ |
 
 ---
 
 ## Tensor Parallelism Summary
 
-| Component            | What is sharded            | All-reduce location          |
-|----------------------|----------------------------|------------------------------|
-| Attention Q/KV/O     | heads (`num_heads // tp`)  | inside `RowParallelLinear` (o_proj) |
-| MotifMLP gate/up     | intermediate dim (`I // tp`) | inside `RowParallelLinear` (down_proj) |
-| MotifMoEExperts      | experts (`E // tp`)        | explicit `tensor_model_parallel_all_reduce` at end of forward |
-| Router gate          | replicated                 | none                         |
-| Embeddings           | vocab dim                  | `VocabParallelEmbedding`     |
+| Component | What is sharded | All-reduce location |
+| --- | --- | --- |
+| Attention Q/KV/O | heads (`num_heads // tp`) | inside `RowParallelLinear` (o_proj) |
+| MotifMLP gate/up | intermediate dim (`I // tp`) | inside `RowParallelLinear` (down_proj) |
+| MotifMoEExperts | experts (`E // tp`) | explicit `tensor_model_parallel_all_reduce` at end of forward |
+| Router gate | replicated | none |
+| Embeddings | vocab dim | `VocabParallelEmbedding` |
 
 ---
 
@@ -351,7 +454,7 @@ shift that compounds across the (majority) SWA layers.
 
 The checkpoint uses different key names than vLLM's internal naming. `load_weights` applies a rename map at load time:
 
-```
+```text
 moe.router.gate   →  moe.gate
 moe.expert_bias   →  moe.e_score_correction_bias
 self_attn.wq_a    →  self_attn.q_a_proj

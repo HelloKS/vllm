@@ -612,6 +612,21 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
       can_implement_status == cutlass::Status::kSuccess,
       "Failed to implement GEMM: status=", (int)can_implement_status);
 
+  int max_shared_bytes = 0;
+  auto shared_status = cudaDeviceGetAttribute(
+      &max_shared_bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+      a.get_device_index());
+  STD_TORCH_CHECK(shared_status == cudaSuccess,
+                  "Cannot query NVFP4 shared memory limit: ",
+                  cudaGetErrorString(shared_status));
+  constexpr size_t required_shared_bytes =
+      sizeof(typename Gemm::GemmKernel::SharedStorage);
+  STD_TORCH_CHECK(
+      required_shared_bytes <= static_cast<size_t>(max_shared_bytes),
+      "SM120 NVFP4 grouped GEMM requires ", required_shared_bytes,
+      " bytes shared memory, device permits ", max_shared_bytes,
+      ". A smaller tile/stage configuration is required.");
+
   // Run the GEMM
   auto status = gemm_op.initialize(args, workspace.data_ptr());
   STD_TORCH_CHECK(status == cutlass::Status::kSuccess,

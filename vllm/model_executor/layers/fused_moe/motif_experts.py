@@ -17,7 +17,6 @@ allgather_reducescatter, flashinfer_all2allv, mori).
 from __future__ import annotations
 
 import torch
-import triton.language as tl
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import tensor_model_parallel_all_reduce
@@ -47,6 +46,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl
 
 
 class _MotifPolyNormExpertsBase(mk.FusedMoEExpertsModular):
@@ -188,12 +188,9 @@ class MotifTritonExperts(_MotifPolyNormExpertsBase):
             polynorm_sigmoid_weight=polynorm_sigmoid_weight,
             eps=eps,
         )
-        # bf16/fp16 only: quantized MoE never goes through this class —
-        # block-FP8 is MotifDeepGemmMoEMethod, MXFP8 is MotifMxfp8Experts.
-        assert (
-            quant_config.weight_quant_dtype is None
-            and quant_config.ocp_mx_scheme is None
-        ), "MotifTritonExperts: only unquantized (bf16/fp16) weights supported"
+        self._block_fp8 = quant_config.weight_quant_dtype == torch.float8_e4m3fn
+        if self._block_fp8 and self.block_shape != [128, 128]:
+            raise ValueError("Motif Triton FP8 requires 128x128 weight blocks")
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -259,10 +256,22 @@ class MotifTritonExperts(_MotifPolyNormExpertsBase):
             w1.size(),
             w2.size(),
             top_k_num,
-            self.quant_config.config_name(hidden_states.dtype),
+            "fp8_w8a8"
+            if self._block_fp8
+            else self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
             block_shape=self.block_shape,
         )
+
+        if current_platform.is_device_capability_family(120):
+            config = dict(
+                BLOCK_SIZE_M=16,
+                BLOCK_SIZE_N=32,
+                BLOCK_SIZE_K=128,
+                GROUP_SIZE_M=1,
+                num_warps=4,
+                num_stages=1,
+            )
 
         compute_type = {
             torch.bfloat16: tl.bfloat16,
@@ -280,10 +289,22 @@ class MotifTritonExperts(_MotifPolyNormExpertsBase):
             topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
 
+        gemm1_input = hidden_states
+        if self._block_fp8:
+            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                per_token_group_quant_fp8,
+            )
+
+            gemm1_input, a1q_scale = per_token_group_quant_fp8(
+                hidden_states,
+                128,
+                use_ue8m0=False,
+            )
+
         # GEMM1: hidden_states @ w1 → intermediate_cache1 [num_tokens, top_k,
         # 2*intermediate_size]
         invoke_fused_moe_triton_kernel(
-            hidden_states,
+            gemm1_input,
             w1,
             intermediate_cache1,
             a1q_scale,
@@ -296,7 +317,7 @@ class MotifTritonExperts(_MotifPolyNormExpertsBase):
             top_k_num,
             config,
             compute_type=compute_type,
-            use_fp8_w8a8=False,
+            use_fp8_w8a8=self._block_fp8,
             use_int8_w8a8=False,
             use_int8_w8a16=False,
             use_int4_w4a16=False,
@@ -320,10 +341,18 @@ class MotifTritonExperts(_MotifPolyNormExpertsBase):
 
         intermediate_cache2.copy_(act_out.to(intermediate_cache2.dtype))
 
+        gemm2_input = intermediate_cache2
+        if self._block_fp8:
+            gemm2_input, a2_scale = per_token_group_quant_fp8(
+                intermediate_cache2,
+                128,
+                use_ue8m0=False,
+            )
+
         # GEMM2: intermediate_cache2 @ w2 → intermediate_cache3 [num_tokens, top_k, K]
         # `mul_routed_weights=True` folds topk_weights into GEMM2.
         invoke_fused_moe_triton_kernel(
-            intermediate_cache2,
+            gemm2_input,
             w2,
             intermediate_cache3,
             a2_scale,
@@ -336,7 +365,7 @@ class MotifTritonExperts(_MotifPolyNormExpertsBase):
             1,
             config,
             compute_type=compute_type,
-            use_fp8_w8a8=False,
+            use_fp8_w8a8=self._block_fp8,
             use_int8_w8a8=False,
             use_int8_w8a16=False,
             use_int4_w4a16=False,
@@ -399,7 +428,7 @@ class MoEPrepareAndFinalizeIdentityAllReduce(mk.FusedMoEPrepareAndFinalizeModula
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
         # Identity dispatch: input is already replicated at every TP rank.
-        # MotifTritonExperts is bf16-only (asserted), so no quantization.
+        # Quantized Motif experts own activation quantization inside apply.
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
             assert topk == 1, (
@@ -458,7 +487,12 @@ class _MotifPolyNormMoEMethodBase(UnquantizedFusedMoEMethod):
         polynorm_sigmoid_weight: bool,
         use_identity_allreduce: bool = False,
     ):
-        super().__init__(moe)
+        # Motif owns dispatch; do not select a temporary SiLU/TRT-LLM backend.
+        from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+            FusedMoEMethodBase,
+        )
+
+        FusedMoEMethodBase.__init__(self, moe)
         self.poly_norm_weight = poly_norm_weight
         self.poly_norm_bias = poly_norm_bias
         self.hidden_clamp = hidden_clamp
@@ -470,15 +504,46 @@ class _MotifPolyNormMoEMethodBase(UnquantizedFusedMoEMethod):
         self.experts_cls = MotifTritonExperts
         self.supports_pre_processed_weights = False
 
+    @property
+    def supports_eplb(self):
+        return False
+
+    def maybe_roundup_sizes(
+        self,
+        hidden_size,
+        intermediate_size_per_partition,
+        act_dtype,
+        moe_parallel_config,
+    ):
+        from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+            FusedMoEMethodBase,
+        )
+
+        return FusedMoEMethodBase.maybe_roundup_sizes(
+            self,
+            hidden_size,
+            intermediate_size_per_partition,
+            act_dtype,
+            moe_parallel_config,
+        )
+
     def _init_motif_kernel(self, layer):
         prepare_finalize = self.maybe_make_prepare_finalize(
             layer._expert_routing_tables()
         )
         assert prepare_finalize is not None
+        if prepare_finalize.activation_format != FusedMoEActivationFormat.Standard:
+            raise NotImplementedError(
+                "Motif PolyNorm requires Standard-format dispatch"
+            )
         self.moe_kernel = mk.FusedMoEKernel(
             prepare_finalize=prepare_finalize,
             fused_experts=self.select_gemm_impl(prepare_finalize, layer),
         )
+
+        from vllm.model_executor.models.motif_weight_utils import log_motif_load_memory
+
+        log_motif_load_memory("ready", layer)
 
     def maybe_make_prepare_finalize(self, routing_tables=None):
         # TP-only Motif path: skip all2all backends entirely. Input is already

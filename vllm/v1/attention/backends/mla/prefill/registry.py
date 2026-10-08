@@ -52,6 +52,9 @@ class MLAPrefillBackendEnum(Enum, metaclass=_MLAPrefillBackendEnumMeta):
         "vllm.v1.attention.backends.mla.prefill.aiter_flash_attn."
         "AiterFlashAttnPrefillBackend"
     )
+    MOTIF_TRITON = (
+        "vllm.v1.attention.backends.mla.prefill.motif_triton.MotifTritonPrefillBackend"
+    )
     CPU = "vllm.v1.attention.backends.mla.prefill.cpu_sdpa.CPUSDPAMLAPrefillBackend"
     ZEN_CPU = (
         "vllm.v1.attention.backends.mla.prefill.zen_cpu_sdpa."

@@ -33,9 +33,9 @@ slot assignment is contiguous with base model layers.
 
 import logging
 import os
-import re
 from collections.abc import Iterable
 
+import regex as re
 import torch
 import torch.nn as nn
 
@@ -478,54 +478,8 @@ class MotifMTP(nn.Module):
         params_dict: dict,
         loaded_params: set,
     ) -> bool:
-        fused_layer = moe_module.experts
+        from vllm.model_executor.models.motif import MotifForCausalLM
 
-        if "moe.experts.gate_up_proj" in name:
-            target = name.replace("moe.experts.gate_up_proj", "moe.experts.w13_weight")
-            param = params_dict.get(target)
-            if param is None:
-                return True
-            E_ckpt, two_I, _ = loaded_weight.shape
-            intermediate_size = two_I // 2
-            for ge in range(E_ckpt):
-                param.weight_loader(
-                    param, loaded_weight[ge, :intermediate_size, :], target, "w1", ge
-                )
-                param.weight_loader(
-                    param, loaded_weight[ge, intermediate_size:, :], target, "w3", ge
-                )
-            loaded_params.add(target)
-            return True
-
-        if "moe.experts.down_proj" in name:
-            target = name.replace("moe.experts.down_proj", "moe.experts.w2_weight")
-            param = params_dict.get(target)
-            if param is None:
-                return True
-            for ge in range(loaded_weight.shape[0]):
-                param.weight_loader(param, loaded_weight[ge], target, "w2", ge)
-            loaded_params.add(target)
-            return True
-
-        for ckpt_frag, vllm_frag in (
-            ("moe.experts.act_fn.weight", "moe.experts.act_fn_weight"),
-            ("moe.experts.act_fn.bias", "moe.experts.act_fn_bias"),
-        ):
-            if ckpt_frag in name:
-                target = name.replace(ckpt_frag, vllm_frag)
-                param = params_dict.get(target)
-                if param is None:
-                    return True
-                expert_map = getattr(fused_layer, "_expert_map", None)
-                if expert_map is None:
-                    param.data.copy_(loaded_weight.to(param.dtype))
-                else:
-                    for ge in range(loaded_weight.shape[0]):
-                        le = int(expert_map[ge].item())
-                        if le < 0:
-                            continue
-                        param.data[le].copy_(loaded_weight[ge].to(param.dtype))
-                loaded_params.add(target)
-                return True
-
-        return False
+        return MotifForCausalLM._load_fused_moe_expert_weight(
+            self, name, loaded_weight, moe_module, params_dict, loaded_params
+        )
