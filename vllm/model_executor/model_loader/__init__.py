@@ -9,6 +9,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.dashq_loader import DashQModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.modelexpress_loader import (
@@ -31,6 +32,7 @@ logger = init_logger(__name__)
 # Reminder: Please update docstring in `LoadConfig`
 # if a new load format is added here
 LoadFormats = Literal[
+    "dashq",
     "auto",
     "hf",
     "dummy",
@@ -48,6 +50,7 @@ LoadFormats = Literal[
     "tensorizer",
 ]
 _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
+    "dashq": DashQModelLoader,
     "auto": DefaultModelLoader,
     "hf": DefaultModelLoader,
     "dummy": DummyModelLoader,

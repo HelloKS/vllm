@@ -34,6 +34,7 @@ class LoadConfig:
     - "auto" will try to load the weights in the safetensors format and fall
       back to the pytorch bin format if safetensors format is not available.
     - "pt" will load the weights in the pytorch bin format.
+    - "dashq" streams DASH-Q INT2/g32 weights directly into TP partitions.
     - "safetensors" will load the weights in the safetensors format.
     - "instanttensor" will load the Safetensors weights on CUDA devices using
       InstantTensor, which enables distributed loading with pipelined prefetching

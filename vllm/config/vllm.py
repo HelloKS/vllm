@@ -1547,6 +1547,12 @@ class VllmConfig:
                 "`--enable-mamba-cache-stochastic-rounding`."
             )
 
+        if self.model_config is not None and self.model_config.quantization == "dashq":
+            if self.load_config.load_format == "auto":
+                self.load_config.load_format = "dashq"
+            elif self.load_config.load_format != "dashq":
+                raise ValueError("DASH-Q checkpoints require --load-format dashq")
+
         if self.quant_config is None and self.model_config is not None:
             self.quant_config = VllmConfig._get_quantization_config(
                 self.model_config, self.load_config

@@ -1372,6 +1372,19 @@ class ModelConfig:
         # Parse quantization method from the HF model config, if available.
         quant_cfg = self.model_arch_config.quantization_config
 
+        dashq = getattr(self.hf_config, "dashq", None)
+        if dashq is not None:
+            if (
+                dashq.get("format") != "dashq-packed-linear"
+                or dashq.get("format_version") != 1
+            ):
+                raise ValueError("Unsupported DASH-Q checkpoint format")
+            if self.quantization not in (None, "dashq"):
+                raise ValueError("DASH-Q checkpoint requires quantization=dashq")
+            if quant_cfg is not None and quant_cfg.get("quant_method") != "dashq":
+                raise ValueError("Conflicting DASH-Q quantization metadata")
+            self.quantization = "dashq"
+
         if quant_cfg is not None:
             quant_method = quant_cfg["quant_method"]
             # Quantization methods which are overrides (i.e. they have a
