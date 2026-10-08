@@ -238,7 +238,7 @@ class InputProcessor:
             validate_think_budget_xargs(
                 params,
                 reasoning_enabled=reasoning_on,
-                v2_model_runner=self.use_v2_model_runner,
+                v2_model_runner=self.vllm_config.use_v2_model_runner,
             )
             # The repetition guard is think-only, so it requires reasoning.
             # This is a 400 only when the REQUEST opted in; the VLLM_REP_MODE
@@ -544,7 +544,7 @@ class InputProcessor:
                     self.vllm_config.reasoning_config is not None
                     and self.vllm_config.reasoning_config.enabled
                 ),
-                v2_model_runner=self.use_v2_model_runner,
+                v2_model_runner=self.vllm_config.use_v2_model_runner,
             )
         else:
             pooling_params = params.clone()

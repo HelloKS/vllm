@@ -84,6 +84,7 @@ def _validate(enable_trace_replay: bool) -> None:
         ),
         vllm_config=SimpleNamespace(
             reasoning_config=None,
+            use_v2_model_runner=True,
             # Engine has no watermark configuration.
             _check_supports_watermarking=lambda params: False,
         ),
