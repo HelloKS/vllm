@@ -48,17 +48,31 @@ class TritonDiffKVBackend(TritonAttentionBackend):
 class TritonDiffKVImpl(TritonAttentionImpl):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if (
-            self.kv_cache_dtype not in TritonDiffKVBackend.supported_kv_cache_dtypes
-            or self.attn_type != AttentionType.DECODER
-            or self.alibi_slopes is not None
-            or self.sinks is not None
-            or self.logits_soft_cap
-            or self.chunk_lookback != -1
-            or self.use_alibi_sqrt
-        ):
+        unsupported = []
+        if self.kv_cache_dtype not in TritonDiffKVBackend.supported_kv_cache_dtypes:
+            unsupported.append(f"kv_cache_dtype={self.kv_cache_dtype!r}")
+        if self.attn_type != AttentionType.DECODER:
+            unsupported.append(f"attn_type={self.attn_type!r}")
+        if self.alibi_slopes is not None:
+            unsupported.append("alibi_slopes is set")
+        if self.sinks is not None:
+            unsupported.append("sinks is set")
+        if self.logits_soft_cap:
+            unsupported.append(f"logits_soft_cap={self.logits_soft_cap!r}")
+        if self.chunk_lookback != -1:
+            unsupported.append(f"chunk_lookback={self.chunk_lookback!r}")
+        if self.use_alibi_sqrt:
+            unsupported.append("use_alibi_sqrt=True")
+        if unsupported:
+            hint = (
+                " Use --kv-cache-dtype bfloat16 with --dtype bfloat16; "
+                "NVFP4 checkpoint weights do not require quantized KV cache."
+                if self.kv_cache_dtype
+                not in TritonDiffKVBackend.supported_kv_cache_dtypes
+                else ""
+            )
             raise NotImplementedError(
-                "Motif DiffKV supports decoder BF16/FP16 KV without sinks/ALiBi/softcap"
+                "Motif DiffKV does not support " + ", ".join(unsupported) + "." + hint
             )
         self.supports_quant_query_input = False
 
