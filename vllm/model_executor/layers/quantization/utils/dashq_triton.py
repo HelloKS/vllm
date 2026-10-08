@@ -24,8 +24,8 @@ def _gemv(
     TOPK: tl.constexpr,
     SPLITS: tl.constexpr,
     MODE: tl.constexpr,
-    BN: tl.constexpr = 32,
-    BK: tl.constexpr = 256,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
 ):
     pn, pair, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     n = pn * BN + tl.arange(0, BN)
@@ -58,7 +58,7 @@ def _reduce_parts(
     SPLITS: tl.constexpr,
     RS: tl.constexpr,
     RELU2: tl.constexpr,
-    BN: tl.constexpr = 128,
+    BN: tl.constexpr,
 ):
     pair, pn = tl.program_id(0), tl.program_id(1)
     s = tl.arange(0, RS)
@@ -87,8 +87,8 @@ def _linear_gemm(
     N: tl.constexpr,
     K: tl.constexpr,
     SPLITS: tl.constexpr,
-    BM: tl.constexpr = 16,
-    BN: tl.constexpr = 64,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
 ):
     pm, pn, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     m, n = pm * BM + tl.arange(0, BM), pn * BN + tl.arange(0, BN)
@@ -124,8 +124,8 @@ def _grouped_gemm(
     K: tl.constexpr,
     TOPK: tl.constexpr,
     UP: tl.constexpr,
-    BM: tl.constexpr = 16,
-    BN: tl.constexpr = 64,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
 ):
     block, pn = tl.program_id(0), tl.program_id(1)
     if block * BM >= tl.load(PADDED):
@@ -169,7 +169,7 @@ def _combine(
     N: tl.constexpr,
     TOPK: tl.constexpr,
     RT: tl.constexpr,
-    BN: tl.constexpr = 128,
+    BN: tl.constexpr,
 ):
     token, pn = tl.program_id(0), tl.program_id(1)
     t, n = tl.arange(0, RT), pn * BN + tl.arange(0, BN)
@@ -193,8 +193,23 @@ def _gemv_forward(x, q, s, z, ids, pairs, mode, topk, relu2=False):
     splits = triton.cdiv(k, 256)
     partial = torch.empty((pairs, splits, n), device=x.device, dtype=torch.float32)
     output = torch.empty((pairs, n), device=x.device, dtype=x.dtype)
+    # Inductor captures explicit launch arguments, not JIT signature defaults.
+    # Keep all tile dimensions required and supply them at every launch.
     _gemv[(triton.cdiv(n, 32), pairs, splits)](
-        x, q, s, z, ids, partial, n, k, topk, splits, mode, num_warps=4
+        x,
+        q,
+        s,
+        z,
+        ids,
+        partial,
+        n,
+        k,
+        topk,
+        splits,
+        mode,
+        BN=32,
+        BK=256,
+        num_warps=4,
     )
     _reduce_parts[(pairs, triton.cdiv(n, 128))](
         partial,
@@ -203,6 +218,7 @@ def _gemv_forward(x, q, s, z, ids, pairs, mode, topk, relu2=False):
         splits,
         triton.next_power_of_2(splits),
         relu2,
+        BN=128,
         num_warps=4,
     )
     return output
@@ -234,6 +250,8 @@ def dashq_linear(x, q, scale, zero, bias=None):
             n,
             k,
             splits,
+            BM=16,
+            BN=64,
             num_warps=4,
         )
         _reduce_parts[(m, triton.cdiv(n, 128))](
@@ -243,6 +261,7 @@ def dashq_linear(x, q, scale, zero, bias=None):
             splits,
             triton.next_power_of_2(splits),
             False,
+            BN=128,
         )
     if bias is not None:
         y = y + bias
@@ -290,6 +309,8 @@ def dashq_moe(x, q1, s1, z1, q2, s2, z2, topk_weights, topk_ids):
                 k,
                 topk,
                 is_up,
+                BM=16,
+                BN=64,
                 num_warps=4,
             )
     y = torch.empty_like(x)
@@ -300,5 +321,6 @@ def dashq_moe(x, q1, s1, z1, q2, s2, z2, topk_weights, topk_ids):
         h,
         topk,
         triton.next_power_of_2(topk),
+        BN=128,
     )
     return y

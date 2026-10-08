@@ -46,6 +46,16 @@ def test_linear_matches_dequantized_reference(m, n, k):
     assert_error(dashq_linear(x, q, s, z, bias), expected)
 
 
+@pytest.mark.parametrize("m", [1, 2, 33])
+def test_linear_inductor_compilation(m):
+    """Inductor must receive tile constexprs on GEMV and both GEMM paths."""
+    q, s, z, ref = weights(130, 96)
+    x = torch.randn((m, 96), device="cuda", dtype=torch.bfloat16)
+    compiled = torch.compile(dashq_linear, backend="inductor", fullgraph=True)
+    expected = (x.float() @ ref).bfloat16() if m == 1 else x @ ref.bfloat16()
+    assert_error(compiled(x, q, s, z), expected)
+
+
 def reference_moe(x, w1, w2, route, ids):
     y = torch.zeros_like(x, dtype=torch.float32)
     for row in range(x.shape[0]):
@@ -77,6 +87,19 @@ def test_moe_empty_and_shared_experts(m):
     )
     route = torch.softmax(torch.randn((m, 2), device="cuda"), -1)
     actual = dashq_moe(x, q1, s1, z1, q2, s2, z2, route, ids)
+    assert_error(actual, reference_moe(x, w1, w2, route, ids))
+
+
+@pytest.mark.parametrize("m", [1, 2, 33])
+def test_moe_inductor_compilation(m):
+    """Cover explicit tile arguments in routed GEMV, grouped GEMM and combine."""
+    q1, s1, z1, w1 = weights(128, 64, 4)
+    q2, s2, z2, w2 = weights(64, 128, 4)
+    x = torch.randn((m, 64), device="cuda", dtype=torch.bfloat16)
+    ids = torch.rand((m, 4), device="cuda").argsort(-1)[:, :2].int()
+    route = torch.softmax(torch.randn((m, 2), device="cuda"), -1)
+    compiled = torch.compile(dashq_moe, backend="inductor", fullgraph=True)
+    actual = compiled(x, q1, s1, z1, q2, s2, z2, route, ids)
     assert_error(actual, reference_moe(x, w1, w2, route, ids))
 
 

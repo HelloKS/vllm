@@ -16,8 +16,23 @@ Local validation on 2026-10-08: 21 CPU tests passed on Windows with PyTorch
 2.14.1+cpu and Transformers 5.19.0, including exact streamed-versus-resident
 reference comparison. The three-prompt tiny reference run, Ruff, repository
 import/API/header checks, Python syntax, Bash syntax, and Markdown lint passed.
-The 29 CUDA kernel cases, native Linux vLLM loading, full-model accuracy, TP=2,
-memory peaks, and API/CUDA Graph serving have **not** been run on GB10 yet.
+The CUDA kernel cases, native Linux vLLM loading, full-model accuracy, TP=2,
+memory peaks, and API/CUDA Graph serving have **not** been verified on GB10 yet.
+
+## TorchInductor launch argument fix (2026-10-09)
+
+A production-checkpoint run reported a Triton compilation failure at
+`pm * BM + tl.arange(0, BM)` with `NoneType ... type` through TorchInductor.
+The original launches omitted tile arguments and relied on JIT signature
+defaults. All five kernels now require explicit tile constexprs, and every
+launch supplies them. Six GPU regression cases cover `torch.compile` for Linear
+and MoE at batch sizes 1, 2 and 33. The fix still requires GB10 runtime validation.
+
+For the first retry use the small serving profile below with `EAGER=1`, then
+validate graphs separately. Large contexts, concurrency and prefill batches
+should be increased only after the accuracy and memory gates pass. A compiled
+run and an eager run exercise different compiler paths; successful eager
+inference alone does not verify the Inductor regression.
 
 ## Build and pin the environment
 
