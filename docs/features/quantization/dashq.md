@@ -162,6 +162,12 @@ are split by logical segment; expert intermediate dimensions are TP-sharded;
 latent projections are replicated. All quantized modules and remaining model
 parameters must be accounted for. Missing or incompatible tensors fail loading.
 
+Loading displays a tensor-count progress bar with elapsed time, ETA and loading
+rate, using the same text format and rank-zero policy as the safetensors loader.
+It covers packed weights, scale/zero tensors and the remaining unquantized
+weights, and respects `LoadConfig.use_tqdm_on_load`. Progress counts completed
+tensors rather than bytes, so differently sized tensors take different times.
+
 Run the slow full reference on an idle node, **before** serving. Only one layer
 is resident; do not try to load the whole 550B Transformers model on one GB10.
 

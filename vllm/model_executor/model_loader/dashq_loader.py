@@ -6,9 +6,11 @@ import json
 from pathlib import Path
 
 import torch
+from tqdm.auto import tqdm
 
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.weight_utils import _BAR_FORMAT, enable_tqdm
 from vllm.transformers_utils.dashq import (
     DashQTensorReader,
     _unique_object,
@@ -54,13 +56,24 @@ class DashQModelLoader(BaseModelLoader):
         return super().create_model(vllm_config, model_config, prefix)
 
     def load_weights(self, model, model_config):
+        logger.info("Loading DASH-Q checkpoint weights from %s", model_config.model)
         folder = self._folder(model_config)
         with (Path(folder) / "dashq_config.json").open() as f:
             metadata = validate_metadata(json.load(f, object_pairs_hook=_unique_object))
         reader = DashQTensorReader(folder)
         consumed, sources, quant_params = set(), set(), set()
         try:
-            with torch.no_grad():
+            with (
+                tqdm(
+                    total=len(reader.index),
+                    desc="Loading DASH-Q checkpoint tensors",
+                    disable=not enable_tqdm(self.load_config.use_tqdm_on_load),
+                    bar_format=_BAR_FORMAT,
+                    unit="tensor",
+                    mininterval=1.0,
+                ) as progress,
+                torch.no_grad(),
+            ):
                 for layer in model.modules():
                     for source, prefix, expert, slices, offset in getattr(
                         layer, "dashq_sources", []
@@ -86,6 +99,7 @@ class DashQModelLoader(BaseModelLoader):
                                 offset,
                             )
                             consumed.add(f"{source}.{suffix}")
+                            progress.update(1)
                 if sources != metadata.keys():
                     raise ValueError(
                         "DASH-Q metadata/model coverage mismatch: "
@@ -97,6 +111,7 @@ class DashQModelLoader(BaseModelLoader):
                         if name not in consumed:
                             consumed.add(name)
                             yield name, reader.tensor(name)
+                            progress.update(1)
 
                 loaded = model.load_weights(remaining())
                 expected = {
