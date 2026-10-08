@@ -205,6 +205,7 @@ class ModelArchConfigConvertorBase:
     def get_num_experts_per_token(self) -> int:
         names = [
             "num_experts_per_tok",
+            "experts_top_k",
             "num_experts_per_token",
             "top_k_experts",
             "moe_topk",

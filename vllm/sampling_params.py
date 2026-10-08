@@ -8,7 +8,7 @@ import math
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import msgspec
 import numpy as np
@@ -183,11 +183,34 @@ class RepetitionDetectionParams:
     detection. Must be >= 2. Example: 3 for detecting a phrase repeated
     3 times. Must be used together with max_pattern_size."""
 
+    mode: Literal["truncate", "off"] | None = None
+    """Opt-in reasoning repetition guard; mutually exclusive with hard stops."""
+
+    scope: Literal["think"] | None = None
+    """Only reasoning tokens can be guarded. Requires an explicit mode."""
+
     def __post_init__(self):
+        if self.mode not in (None, "truncate", "off"):
+            raise VLLMValidationError("mode must be 'truncate' or 'off'.")
+        if self.scope not in (None, "think"):
+            raise VLLMValidationError("scope only supports 'think'.")
+        if self.scope is not None and self.mode is None:
+            raise VLLMValidationError("scope requires an explicit mode.")
+        if self.mode == "truncate":
+            if self.max_pattern_size > 0:
+                raise VLLMValidationError(
+                    "The reasoning guard is mutually exclusive with "
+                    "max_pattern_size > 0."
+                )
+            if self.min_count == 1:
+                raise VLLMValidationError("min_count must be 0 or >= 2.")
         if (
             self.max_pattern_size < 0
             or self.min_pattern_size < 0
-            or self.min_pattern_size > self.max_pattern_size
+            or (
+                self.mode != "truncate"
+                and self.min_pattern_size > self.max_pattern_size
+            )
         ):
             raise VLLMValidationError(
                 "max_pattern_size, min_pattern_size must be >=0, "

@@ -221,6 +221,40 @@ class InputProcessor:
             # Resolved last so that feature gates above report the missing
             # feature rather than its incompatibility with watermarking.
             watermarking = self.resolve_watermarking(params)
+
+            # MOTIF: 400 malformed or misconfigured think-budget vllm_xargs
+            # (server-wide env defaults degrade with a warning instead).
+            from vllm.v1.sample.logits_processor.repetition import (
+                resolve_rep_guard_request_config,
+            )
+            from vllm.v1.sample.logits_processor.think_budget import (
+                validate_think_budget_xargs,
+            )
+
+            reasoning_on = (
+                self.vllm_config.reasoning_config is not None
+                and self.vllm_config.reasoning_config.enabled
+            )
+            validate_think_budget_xargs(
+                params,
+                reasoning_enabled=reasoning_on,
+                v2_model_runner=self.use_v2_model_runner,
+            )
+            # The repetition guard is think-only, so it requires reasoning.
+            # This is a 400 only when the REQUEST opted in; the VLLM_REP_MODE
+            # server-wide default degrades silently instead (the processor
+            # warned at startup). Malformed xargs raise here as well.
+            rep_config = resolve_rep_guard_request_config(params)
+            if (
+                rep_config is not None
+                and rep_config["source"] == "request"
+                and not reasoning_on
+            ):
+                raise ValueError(
+                    "The repetition guard is think-only and requires "
+                    "reasoning to be enabled (--reasoning-parser); this "
+                    "server has no thinking section to guard."
+                )
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [
                 task for task in supported_tasks if task in POOLING_TASKS
@@ -494,6 +528,24 @@ class InputProcessor:
                 sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
+
+            # MOTIF: resolve ratio think-budgets and the forced end sequence
+            # at admission; the worker-side ThinkingBudgetStateHolder only
+            # ever sees absolute budgets (and optional pre-encoded force ids).
+            from vllm.v1.sample.logits_processor.think_budget import (
+                resolve_thinking_budget_for_request,
+            )
+
+            resolve_thinking_budget_for_request(
+                sampling_params,
+                length_from_prompt_token_ids_or_embeds(prompt_token_ids, prompt_embeds),
+                self.model_config,
+                reasoning_enabled=(
+                    self.vllm_config.reasoning_config is not None
+                    and self.vllm_config.reasoning_config.enabled
+                ),
+                v2_model_runner=self.use_v2_model_runner,
+            )
         else:
             pooling_params = params.clone()
 

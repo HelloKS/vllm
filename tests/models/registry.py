@@ -432,6 +432,7 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
             "tiny-random": "TitanML/tiny-mixtral",
         },
     ),
+    "MotifForCausalLM": _HfExamplesInfo("Motif-Technologies/Motif-3"),
     "NemotronForCausalLM": _HfExamplesInfo("nvidia/Minitron-8B-Base"),
     "NemotronHForCausalLM": _HfExamplesInfo(
         "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
@@ -1776,6 +1777,10 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         "MiniMaxAI/MiniMax-M3",
         trust_remote_code=True,
         is_available_online=False,
+    ),
+    "MotifMTPModel": _HfExamplesInfo(
+        "Motif-Technologies/Motif-3",
+        speculative_model="Motif-Technologies/Motif-3",
     ),
     "NemotronHMTPModel": _HfExamplesInfo(
         "nvidia/Nemotron-Super-Placeholder",

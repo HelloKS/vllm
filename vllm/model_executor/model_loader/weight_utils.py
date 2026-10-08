@@ -255,6 +255,13 @@ def get_quant_config(
             n_kv_heads if n_kv_heads is not None else n_heads
         )
 
+    if (
+        hf_quant_config is not None
+        and hf_quant_config.get("quant_method") == "modelopt_nvfp4"
+        and load_config.load_format == "dummy"
+    ):
+        return quant_cls.from_config({"_nvfp4_dynamic": True})
+
     if hf_quant_config is not None:
         # `model_config.quantization_config` may be set alongside a checkpoint
         # quant config: the checkpoint determines `quant_cls`, and the user's
@@ -320,6 +327,35 @@ def get_quant_config(
         assert isinstance(online_args, QuantizationConfigArgs)
         return OnlineQuantizationConfig(args=online_args)
 
+    # Inflight ModelOpt MXFP8 auto-conversion (--quantization modelopt_mxfp8
+    # against a bf16 checkpoint). See ModelOptMxFp8Config.from_config.
+    if model_config.quantization == "modelopt_mxfp8" and "MotifForCausalLM" in (
+        model_config.hf_config.architectures or []
+    ):
+        return quant_cls.from_config({"_mxfp8_dynamic": True})
+    # Same dynamic bf16-load path, DeepGEMM block-FP8 (1x128) MoE variant.
+    # See ModelOptBlockFp8Config.from_config.
+    if model_config.quantization == "modelopt_blockfp8":
+        return quant_cls.from_config({"_blockfp8_dynamic": True})
+    # CUTLASS NVFP4 MoE variant: direct load when the checkpoint was
+    # pre-quantized (its config.json declares
+    # quantization_config = {"quant_method": "modelopt_nvfp4"}, which also
+    # auto-selects this method without a --quantization flag); otherwise
+    # dynamic bf16 -> NVFP4 quantization at load time.
+    if model_config.quantization == "modelopt_nvfp4":
+        hf_qcfg = getattr(model_config.hf_config, "quantization_config", None)
+        direct = (
+            isinstance(hf_qcfg, dict)
+            and hf_qcfg.get("quant_method") == "modelopt_nvfp4"
+        )
+        if load_config.load_format == "dummy":
+            # Dummy-format params are uninitialised, so direct-load validation
+            # (positive weight_scale_2 and friends) would reject them. The
+            # dynamic path quantizes whatever the dummy loader produced.
+            direct = False
+        return quant_cls.from_config(
+            {"_nvfp4_dynamic": not direct, "_nvfp4_direct": direct}
+        )
     model_name_or_path = (
         maybe_download_from_modelscope(
             model_config.model,

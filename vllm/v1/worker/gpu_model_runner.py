@@ -190,6 +190,7 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.motif import MotifMTPProposer
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -647,6 +648,8 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.use_gemma4_mtp():
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_motif_mtp():
+                self.drafter = MotifMTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
@@ -5802,11 +5805,13 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         randomize_inputs: bool = False,
+        is_dp_idle_sync: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run a dummy forward pass to warm up/profile run or capture the
         CUDA graph for the model.
 
         Args:
+            is_dp_idle_sync: Whether this dummy run only synchronizes DP ranks.
             num_tokens: Number of tokens to run the dummy forward pass.
             cudagraph_runtime_mode: used to control the behavior.
                 - if not set will determine the cudagraph mode based on using
@@ -6173,12 +6178,22 @@ class GPUModelRunner(
                 ):
                     use_cudagraphs = False
 
-                self.drafter.dummy_run(
-                    num_tokens,
-                    use_cudagraphs=use_cudagraphs,
-                    is_graph_capturing=is_graph_capturing,
-                    slot_mappings=slot_mappings,
-                )
+                # MOTIF: when the dense drafter skips DP batch coordination,
+                # idle-rank per-step dummies have no drafter collective to
+                # pair with, so their draft forwards are pure waste — skip
+                # them so idle ranks reach the next step's main-model
+                # rendezvous sooner. Startup warmup/capture paths (and MoE
+                # drafters, which still coordinate) keep running.
+                if not (
+                    is_dp_idle_sync
+                    and getattr(self.drafter, "skip_draft_dp_coordination", False)
+                ):
+                    self.drafter.dummy_run(
+                        num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        is_graph_capturing=is_graph_capturing,
+                        slot_mappings=slot_mappings,
+                    )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by

@@ -21,6 +21,7 @@ from vllm.model_executor.kernels.mhc.tilelang_kernels import (
 from vllm.model_executor.kernels.mhc.torch import (
     mhc_post_torch,
     mhc_pre_delayed_torch,
+    mhc_pre_torch,
 )
 from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.mhc import (
@@ -1755,3 +1756,22 @@ def test_mhc_fused_post_pre_delayed_falls_back_for_large_batches():
 
     assert not rocm_aiter_ops.mhc_fused_post_pre_delayed_prefers_unfused(1)
     assert rocm_aiter_ops.mhc_fused_post_pre_delayed_prefers_unfused(1 << 20)
+
+
+@pytest.mark.skipif(not HAS_TILELANG_MHC, reason="TileLang MHC support required")
+@pytest.mark.parametrize("num_tokens", [1, 128])
+@pytest.mark.parametrize("logit_scale", [0.1, 30.0])
+def test_motif_mhc_pre_matches_training_convention(num_tokens, logit_scale):
+    """Cover Motif's clamping and transposed Sinkhorn in the fused kernel."""
+    generator = torch.Generator(device=DEVICE).manual_seed(42)
+    residual = torch.randn(
+        num_tokens, 4, 4096, device=DEVICE, dtype=torch.bfloat16, generator=generator
+    )
+    fn = torch.randn(24, 4 * 4096, device=DEVICE, generator=generator) * 1e-4
+    scale = torch.ones(3, device=DEVICE)
+    base = torch.randn(24, device=DEVICE, generator=generator) * logit_scale
+    args = (residual, fn, scale, base, 1e-6, 0.0, 1e-6, 2.0, 20)
+    expected = mhc_pre_torch(*args, motif_sinkhorn=1)
+    actual = torch.ops.vllm.mhc_pre_tilelang(*args, motif_sinkhorn=1)
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, atol=5e-2, rtol=1e-2)

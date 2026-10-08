@@ -26,6 +26,9 @@ from vllm.v1.sample.logits_processor.interface import (
     LogitsProcessor,
     MoveDirectionality,
 )
+from vllm.v1.sample.logits_processor.repetition import (
+    RepetitionGuardLogitsProcessor,
+)
 from vllm.v1.sample.logits_processor.state import BatchUpdateBuilder, LogitsProcessors
 
 if TYPE_CHECKING:
@@ -51,6 +54,11 @@ BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
     MinTokensLogitsProcessor,
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
+    # MOTIF: think-only repetition guard (SA+LCP coverage detector, truncate
+    # steering). Also loaded on the speculative-decoding branch below;
+    # verify-position forcing runs through apply_with_spec_decode in the
+    # RejectionSampler.
+    RepetitionGuardLogitsProcessor,
 ]
 
 
@@ -212,7 +220,13 @@ def build_logitsprocs(
             "min_p and logit_bias parameters won't work with speculative decoding."
         )
         return LogitsProcessors(
-            [MinTokensLogitsProcessor(vllm_config, device, is_pin_memory)]
+            ctor(vllm_config, device, is_pin_memory)
+            for ctor in (
+                MinTokensLogitsProcessor,
+                # MOTIF: spec-aware via apply_with_spec_decode, wired in
+                # RejectionSampler.apply_logits_processors.
+                RepetitionGuardLogitsProcessor,
+            )
         )
 
     custom_logitsprocs_classes = _load_custom_logitsprocs(custom_logitsprocs)
@@ -357,6 +371,7 @@ __all__ = [
     "LogitBiasLogitsProcessor",
     "MinPLogitsProcessor",
     "MinTokensLogitsProcessor",
+    "RepetitionGuardLogitsProcessor",
     "BatchUpdate",
     "BatchUpdateBuilder",
     "MoveDirectionality",

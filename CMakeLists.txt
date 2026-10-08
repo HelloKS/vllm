@@ -454,7 +454,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/libtorch_stable/custom_all_gather_reduce_scatter_ops.cpp"
     "csrc/libtorch_stable/custom_all_reduce.cu"
     "csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"
-    "csrc/libtorch_stable/fused_kimi_k3_mla_key_concat_kv_cache_kernel.cu")
+    "csrc/libtorch_stable/fused_kimi_k3_mla_key_concat_kv_cache_kernel.cu"
+    # motif3 MoE PolyNorm. The NVFP4 kernel itself is arch-gated further down
+    # (FP4_SM100_SRCS); this entry point is always compiled so the op can be
+    # registered unconditionally.
+    "csrc/libtorch_stable/grouped_poly_norm_kernel.cu"
+    "csrc/libtorch_stable/motif_fused_poly_quant_kernel.cu"
+    "csrc/libtorch_stable/grouped_poly_norm_nvfp4_entry.cu")
 
   if(VLLM_GPU_LANG STREQUAL "CUDA" AND
      DEFINED CMAKE_CUDA_COMPILER_VERSION AND
@@ -1048,7 +1054,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/libtorch_stable/quantization/fp4/mxfp4_experts_quant.cu"
       "csrc/libtorch_stable/quantization/fp4/mxfp4_blockwise_moe_kernel.cu"
       "csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu"
-      "csrc/libtorch_stable/nvfp4_ds_mla_cache_kernels.cu")
+      "csrc/libtorch_stable/nvfp4_ds_mla_cache_kernels.cu"
+      # motif3 ModelOpt NVFP4 MoE: grouped PolyNorm fused with NVFP4 quant.
+      # Guarded by ENABLE_NVFP4_SM100 in grouped_poly_norm_nvfp4_entry.cu.
+      "csrc/libtorch_stable/grouped_poly_norm_nvfp4_quant_kernel.cu")
     if(NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
       message(STATUS
         "Building mxfp4_experts_quant unsupported stubs because CUDA compiler version is not >= 12.9 (found ${CMAKE_CUDA_COMPILER_VERSION}).")

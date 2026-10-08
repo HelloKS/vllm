@@ -50,6 +50,15 @@ void computeExpertOffsetsAndInverse(int const* sorted_indices,
                                     int const* sorted_rows, int* inverse,
                                     cudaStream_t stream);
 
+// MOTIF: decode-sized map-only routing (no materialized permuted input, no
+// sorted expert ids) — single-block stable counting sort.
+void stableMapOnlyExpertSortLauncher(const int* topk_ids, const int* expert_map,
+                                     int* permuted_rows,
+                                     int64_t* expert_first_token_offset,
+                                     int num_rows, int num_experts,
+                                     int num_experts_per_node, int topk,
+                                     cudaStream_t stream);
+
 void sortAndScanExpert(const int* expert_for_source_row, const int* source_rows,
                        int* permuted_experts, int* permuted_rows,
                        int64_t* expert_first_token_offset, int num_rows,

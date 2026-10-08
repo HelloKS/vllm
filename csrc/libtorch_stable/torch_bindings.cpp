@@ -162,6 +162,18 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    Tensor! problem_sizes2, "
       "    int n, int k, bool swap_ab) -> ()");
 
+  // Fused variant for the NVFP4 direct-load MoE path: also emits the
+  // expert_offsets consumed by the FP4 grouped MM and the 128-aligned
+  // blockscale_offsets of the swizzled NVFP4 scale-factor layout.
+  ops.def(
+      "get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets("
+      "    Tensor expert_first_token_offset, "
+      "    Tensor! problem_sizes1, "
+      "    Tensor! problem_sizes2, "
+      "    Tensor! expert_offsets, "
+      "    Tensor! blockscale_offsets, "
+      "    int n, int k) -> ()");
+
   // A function that computes data required to run fused MoE with w8a8 grouped
   // GEMM in batched expert format. It takes expert_num_tokens
   // as an input, and computes expert_offsets (token start indices of each
@@ -223,6 +235,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
       "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
       "Tensor output_scale_offset_by_experts) -> ()");
+
+  // Fuse route-map gathering with the first NVFP4 experts quantization.
+  ops.def(
+      "scaled_fp4_experts_quant_permuted(Tensor! output, Tensor! output_scale,"
+      "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
+      "Tensor output_scale_offset_by_experts, Tensor permuted_idx, Tensor! "
+      "inv_permuted_idx, int topk) -> ()");
 
   // Fused SiLU+Mul+NVFP4 experts quantization.
   ops.def(
@@ -327,6 +346,36 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // BF16/FP32 x FP32 -> FP32 router GEMM for H=3072, E=256, M<=32 (SM90+).
   // conditionally compiled so impl registration is in source file
   ops.def("fp32_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+  // Grouped fused-mul PolyNorm activation (motif3 MoE, Standard FusedMoE
+  // activation format). Per-row: row r -> (token_idx, k_idx) =
+  // (r / top_k, r % top_k); local_e = expert_map[topk_ids[token_idx, k_idx]]
+  // (identity when expert_map is None; non-local rows are skipped).
+  // Computes poly = w[local_e] . rms_normed(x^k) + b[local_e]; out = poly *
+  // mul, folding the gate/up clamp in when hidden_clamp > 0.
+  ops.def(
+      "grouped_poly_norm_forward(Tensor input, Tensor mul, Tensor weight, "
+      "Tensor bias, Tensor topk_ids, Tensor? expert_map, int top_k, "
+      "float eps, float hidden_clamp) -> Tensor");
+
+  // motif3 ModelOpt NVFP4 MoE: grouped PolyNorm straight to expert-aware
+  // swizzled NVFP4 activations and E4M3 scale factors for GEMM2.
+  ops.def(
+      "grouped_poly_norm_nvfp4_quant(Tensor! output, Tensor! output_scale, "
+      "Tensor input, Tensor mul, Tensor weight, Tensor bias, "
+      "Tensor expert_offsets, Tensor blockscale_offsets, "
+      "Tensor input_global_scale, float eps, float hidden_clamp, "
+      "float polynorm_output_scale) -> ()");
+
+  // motif3 DeepGEMM MoE: fused grouped PolyNorm + 1x128 FP8 requant. Reads the
+  // combined GEMM1 output gate_up [N, 2I]; returns (out_q [N, I] e4m3, scale).
+  // scale is [N, I/128] column-major fp32, or with packed_scale
+  // [N, ceil(I/128/4)] int32 in DeepGEMM's packed-UE8M0 SFA layout so the
+  // grouped GEMM can skip its transpose_and_pack.
+  ops.def(
+      "grouped_poly_norm_fp8_quant(Tensor gate_up, Tensor weight, Tensor bias, "
+      "Tensor group_ids, float eps, float hidden_clamp, "
+      "float polynorm_output_scale, bool use_ue8m0, "
+      "bool packed_scale=False) -> (Tensor, Tensor)");
 #endif
 
   // Merge attn states
@@ -760,6 +809,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("get_cutlass_moe_mm_data", TORCH_BOX(&get_cutlass_moe_mm_data));
   ops.impl("get_cutlass_moe_mm_problem_sizes_from_expert_offsets",
            TORCH_BOX(&get_cutlass_moe_mm_problem_sizes_from_expert_offsets));
+  ops.impl("get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets",
+           TORCH_BOX(&get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets));
   ops.impl("get_cutlass_batched_moe_mm_data",
            TORCH_BOX(&get_cutlass_batched_moe_mm_data));
 
@@ -768,6 +819,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("scaled_fp4_quant", TORCH_BOX(&scaled_fp4_quant_func));
   ops.impl("scaled_fp4_quant.out", TORCH_BOX(&scaled_fp4_quant_out));
   ops.impl("scaled_fp4_experts_quant", TORCH_BOX(&scaled_fp4_experts_quant));
+  ops.impl("scaled_fp4_experts_quant_permuted",
+           TORCH_BOX(&scaled_fp4_experts_quant_permuted));
   ops.impl("silu_and_mul_scaled_fp4_experts_quant",
            TORCH_BOX(&silu_and_mul_scaled_fp4_experts_quant));
   ops.impl("silu_and_mul_nvfp4_quant", TORCH_BOX(&silu_and_mul_nvfp4_quant));
@@ -780,6 +833,14 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 
   // DSV3 fused A GEMM: conditionally compiled so impl registration is in
   // source file (dsv3_fused_a_gemm.cu)
+  // motif3 MoE PolyNorm ops. grouped_poly_norm_nvfp4_quant resolves to the
+  // always-compiled entry in grouped_poly_norm_nvfp4_entry.cu, which raises if
+  // the build has no NVFP4-capable arch.
+  ops.impl("grouped_poly_norm_forward", TORCH_BOX(&grouped_poly_norm_forward));
+  ops.impl("grouped_poly_norm_nvfp4_quant",
+           TORCH_BOX(&grouped_poly_norm_nvfp4_quant));
+  ops.impl("grouped_poly_norm_fp8_quant",
+           TORCH_BOX(&grouped_poly_norm_fp8_quant));
 #endif
 
   ops.impl("merge_attn_states", TORCH_BOX(&merge_attn_states));

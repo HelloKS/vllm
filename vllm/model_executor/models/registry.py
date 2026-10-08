@@ -158,6 +158,7 @@ _TEXT_GENERATION_MODELS = {
     "MiniCPMForCausalLM": ("minicpm", "MiniCPMForCausalLM"),
     "MiniCPM3ForCausalLM": ("minicpm3", "MiniCPM3ForCausalLM"),
     "MiniMaxM2ForCausalLM": ("minimax_m2", "MiniMaxM2ForCausalLM"),
+    "MotifForCausalLM": ("motif", "MotifForCausalLM"),
     "MiniMaxM3SparseForCausalLM": (
         "vllm.models.minimax_m3",
         "MiniMaxM3SparseForCausalLM",
@@ -620,6 +621,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "MiMoMTPModel": ("mimo_mtp", "MiMoMTP"),
     "MiMoV2MTPModel": ("mimo_v2_mtp", "MiMoV2MTP"),
     "MiMoV2OmniMTPModel": ("mimo_v2_mtp", "MiMoV2OmniMTP"),
+    "MotifMTPModel": ("motif_mtp", "MotifMTP"),
     "EagleCohereForCausalLM": ("cohere_eagle", "EagleCohereForCausalLM"),
     "EagleLlamaForCausalLM": ("llama_eagle", "EagleLlamaForCausalLM"),
     "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
@@ -790,7 +792,6 @@ _VLLM_MODELS = {
 _SUBPROCESS_COMMAND = [sys.executable, "-m", "vllm.model_executor.models.registry"]
 
 _PREVIOUSLY_SUPPORTED_MODELS = {
-    "MotifForCausalLM": "0.10.2",
     "Phi3SmallForCausalLM": "0.9.2",
     "Phi4FlashForCausalLM": "0.10.2",
     "Phi4MultimodalForCausalLM": "0.12.0",
@@ -1531,7 +1532,8 @@ _T = TypeVar("_T")
 
 def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
     # NOTE: We use a temporary directory instead of a temporary file to avoid
-    # issues like https://stackoverflow.com/questions/23212435/permission-denied-to-write-to-my-temporary-file
+    # issues like
+    # https://stackoverflow.com/questions/23212435/permission-denied-to-write-to-my-temporary-file
     with tempfile.TemporaryDirectory() as tempdir:
         output_filepath = os.path.join(tempdir, "registry_output.tmp")
 

@@ -82,6 +82,33 @@ def compute_aligned_M_and_alignment(
     return M_sum, alignment
 
 
+def compute_aligned_M_fixed_alignment(
+    M: int,
+    num_topk: int,
+    local_num_experts: int,
+    alignment: int,
+    expert_tokens_meta: mk.ExpertTokensMetadata | None,
+) -> int:
+    """M_sum for a caller-mandated alignment (no SM100 BLOCK_M downgrade).
+
+    The motif psum pipeline (``expert_aligned_psum`` + the grouped PolyNorm
+    kernel + DeepGEMM's psum-layout GEMM) assumes one fixed per-expert
+    alignment end to end; ``compute_aligned_M_and_alignment``'s adaptive
+    per-call alignment would desynchronize the scatter layout from those
+    consumers (rows/scales land at align_used offsets while psum and the
+    activation kernel index by the fixed block size).
+    """
+    if (expert_tokens_meta is not None) and (
+        expert_tokens_meta.expert_num_tokens_cpu is not None
+    ):
+        return expert_num_tokens_round_up_and_sum(
+            expert_tokens_meta.expert_num_tokens_cpu, alignment=alignment
+        )
+    max_active_experts = min(M * num_topk, local_num_experts)
+    M_sum = (M * num_topk) + max_active_experts * (alignment - 1)
+    return round_up(M_sum, alignment)
+
+
 def compute_aligned_M(
     M: int,
     num_topk: int,
@@ -189,6 +216,7 @@ def _fwd_kernel_ep_scatter_2(
     SCALE_HIDDEN_SIZE: tl.constexpr,
     SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
     PACK_UE8M0: tl.constexpr,
+    SCALE_FP32_UE8M0: tl.constexpr,
     SCALE_PACKED_SIZE: tl.constexpr,
     SCALE_PACKED_SIZE_PAD: tl.constexpr,
 ):
@@ -228,6 +256,13 @@ def _fwd_kernel_ep_scatter_2(
             b3 = tl.load(
                 base_s + g3 * recv_x_scale_stride1, mask=g3 < SCALE_HIDDEN_SIZE
             )
+            if SCALE_FP32_UE8M0:
+                # fp32 scales holding exact powers of two (UE8M0 quantization):
+                # the biased fp32 exponent byte IS the UE8M0 encoding.
+                b0 = (b0.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+                b1 = (b1.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+                b2 = (b2.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+                b3 = (b3.to(tl.uint32, bitcast=True) >> 23) & 0xFF
             packed_s = (
                 b0.to(tl.int32)
                 | (b1.to(tl.int32) << 8)
@@ -289,6 +324,7 @@ def ep_scatter(
     block_size: int = 128,
     pack_ue8m0: bool = False,
     use_psum_layout: bool = False,
+    pack_fp32_ue8m0: bool = False,
 ):
     # BLOCK_E is the m_indices fill-loop tile (masked), independent of align_m.
     BLOCK_E = 128
@@ -353,6 +389,7 @@ def ep_scatter(
         SCALE_HIDDEN_SIZE=scale_hidden_size,
         SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
         PACK_UE8M0=pack_ue8m0,
+        SCALE_FP32_UE8M0=pack_fp32_ue8m0,
         SCALE_PACKED_SIZE=scale_packed_size,
         SCALE_PACKED_SIZE_PAD=triton.next_power_of_2(scale_packed_size),
     )
@@ -464,6 +501,39 @@ def ep_gather(
     return
 
 
+@triton.jit
+def _fwd_kernel_expert_aligned_psum(
+    counts_ptr,
+    counts_i32_ptr,
+    psum_ptr,
+    E: tl.constexpr,
+    ALIGN: tl.constexpr,
+):
+    # Single-program inclusive scan over E (~48) experts. Replaces the eager
+    # add/floordiv/mul/cumsum/cast chain (~5 kernel launches) with one launch:
+    #   psum[e] = sum_{i<=e} align(counts[i]), counts_i32 = counts.int32
+    acc = 0
+    for e in range(E):
+        c = tl.load(counts_ptr + e).to(tl.int32)
+        tl.store(counts_i32_ptr + e, c)
+        acc += ((c + ALIGN - 1) // ALIGN) * ALIGN
+        tl.store(psum_ptr + e, acc)
+
+
+def expert_aligned_psum(
+    expert_num_tokens: torch.Tensor, align: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (counts_int32, psum) where psum[e] is the cumulative
+    ALIGN-aligned end offset per expert (DeepGEMM psum-layout input)."""
+    E = expert_num_tokens.numel()
+    counts_i32 = torch.empty(E, dtype=torch.int32, device=expert_num_tokens.device)
+    psum = torch.empty(E, dtype=torch.int32, device=expert_num_tokens.device)
+    _fwd_kernel_expert_aligned_psum[(1,)](
+        expert_num_tokens, counts_i32, psum, E=E, ALIGN=align
+    )
+    return counts_i32, psum
+
+
 def deepgemm_moe_permute(
     aq: torch.Tensor,
     aq_scale: torch.Tensor,
@@ -474,6 +544,8 @@ def deepgemm_moe_permute(
     aq_out: torch.Tensor | None = None,
     block_size: int | None = None,
     use_psum_layout: bool = False,
+    pack_fp32_ue8m0: bool = False,
+    force_align_m: int | None = None,
 ):
     assert aq.ndim == 2
     assert topk_ids.dtype.is_signed, "The kernel uses -1 to represent invalid topk_ids"
@@ -486,13 +558,25 @@ def deepgemm_moe_permute(
     if block_size is not None:
         block_k = block_size
 
-    M_sum, align_used = compute_aligned_M_and_alignment(
-        M=topk_ids.size(0),
-        num_topk=topk_ids.size(1),
-        local_num_experts=local_num_experts,
-        alignment=block_m,
-        expert_tokens_meta=expert_tokens_meta,
-    )
+    if force_align_m is not None:
+        # Fixed-alignment scatter for consumers that index by a fixed block
+        # size (motif's psum pipeline); see compute_aligned_M_fixed_alignment.
+        align_used = force_align_m
+        M_sum = compute_aligned_M_fixed_alignment(
+            M=topk_ids.size(0),
+            num_topk=topk_ids.size(1),
+            local_num_experts=local_num_experts,
+            alignment=force_align_m,
+            expert_tokens_meta=expert_tokens_meta,
+        )
+    else:
+        M_sum, align_used = compute_aligned_M_and_alignment(
+            M=topk_ids.size(0),
+            num_topk=topk_ids.size(1),
+            local_num_experts=local_num_experts,
+            alignment=block_m,
+            expert_tokens_meta=expert_tokens_meta,
+        )
 
     expert_start_loc = torch.empty(
         (local_num_experts), device=device, dtype=torch.int32
@@ -503,8 +587,13 @@ def deepgemm_moe_permute(
         aq_out = torch.empty((M_sum, H), device=device, dtype=aq.dtype)
 
     # uint8 UE8M0 (MXFP8) -> scatter packs into DeepGEMM's int32 MN-major
-    # TMA-aligned layout; float32 (FP8/FP4) scattered row-major as-is.
-    pack_ue8m0 = aq_scale.dtype == torch.uint8
+    # TMA-aligned layout; float32 (FP8/FP4) scattered row-major as-is, unless
+    # the caller attests via pack_fp32_ue8m0 that its fp32 scales hold exact
+    # powers of two (UE8M0 quantization, e.g. per_token_group_quant_fp8 under
+    # is_deep_gemm_e8m0_used()) -- then scatter extracts the fp32 exponent
+    # bytes and packs them the same way, skipping DeepGEMM's SF transform.
+    pack_fp32 = pack_fp32_ue8m0 and aq_scale.dtype == torch.float32
+    pack_ue8m0 = aq_scale.dtype == torch.uint8 or pack_fp32
     sf_k = H // block_k
     if pack_ue8m0:
         packed_sf_k = (sf_k + 3) // 4
@@ -554,6 +643,7 @@ def deepgemm_moe_permute(
         block_size=block_k,
         pack_ue8m0=pack_ue8m0,
         use_psum_layout=use_psum_layout,
+        pack_fp32_ue8m0=pack_fp32,
     )
 
     return aq_out, aq_scale_out, grouped_layout, inv_perm, align_used

@@ -1432,6 +1432,7 @@ class Worker(WorkerBase):
             num_tokens,
             uniform_decode=True,
             randomize_inputs=self.randomize_dummy_inputs,
+            is_dp_idle_sync=True,
         )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

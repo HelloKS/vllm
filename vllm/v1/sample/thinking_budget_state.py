@@ -12,6 +12,9 @@ from vllm.v1.sample.logits_processor.interface import (
     BatchUpdate,
     MoveDirectionality,
 )
+from vllm.v1.sample.logits_processor.think_budget import (
+    THINK_BUDGET_FORCE_IDS_KEY,
+)
 
 if TYPE_CHECKING:
     from vllm.config.reasoning import ReasoningConfig
@@ -95,6 +98,12 @@ class ThinkingBudgetStateHolder:
                 )
                 self._state[index]["output_tok_ids"] = output_tok_ids
                 self._state[index]["spec_token_ids"] = []
+                # MOTIF: forced end sequence resolved at admission
+                # (think_budget_force_str), bare end ids otherwise.
+                force_ids = (params.extra_args or {}).get(THINK_BUDGET_FORCE_IDS_KEY)
+                self._state[index]["force_end_ids"] = (
+                    list(force_ids) if force_ids else None
+                )
             else:
                 self._state.pop(index, None)
 
@@ -167,6 +176,13 @@ class ThinkingBudgetStateHolder:
             if target_list[i : i + len(token_ids)] == token_ids:
                 return i
         return -1
+
+    def _force_ids(self, state: dict[str, Any]) -> list[int]:
+        """MOTIF: forced end sequence for this request (admission-resolved
+        ``think_budget_force_str``), bare ``think_end_token_ids`` otherwise.
+        Natural-exit DETECTION always uses ``self.think_end_token_ids``; only
+        forcing consults this."""
+        return state.get("force_end_ids") or self.think_end_token_ids
 
     def _init_state_entry(
         self, prompt_tok_ids: list[int] | None, thinking_token_budget: int
@@ -356,9 +372,7 @@ class ThinkingBudgetStateHolder:
         # eg with 999: [2,4,5,999] -> [3,-1,-1,-1]
         if state["in_end"] and state["end_count"] == 0:
             new_tokens = output[prev_length:]
-            stopping_thinking = (
-                self.think_end_token_ids[state["end_count"]] in new_tokens
-            )
+            stopping_thinking = self._force_ids(state)[state["end_count"]] in new_tokens
             if not stopping_thinking:
                 state["in_think"] = True
                 state["in_end"] = False
@@ -446,10 +460,13 @@ class ThinkingBudgetStateHolder:
 
         else:
             state["force_index"] = []
+            # MOTIF: forcing emits the per-request force sequence; natural
+            # exit detection above keeps using the bare end ids.
+            force_ids = self._force_ids(state)
             if len(state["spec_token_ids"]) > 0:
                 for i, token_id in enumerate(state["spec_token_ids"]):
-                    if state["end_count"] + 1 < len(self.think_end_token_ids):
-                        if token_id == self.think_end_token_ids[state["end_count"] + 1]:
+                    if state["end_count"] + 1 < len(force_ids):
+                        if token_id == force_ids[state["end_count"] + 1]:
                             state["end_count"] += 1
                         else:
                             state["end_count"] += 1
@@ -463,7 +480,7 @@ class ThinkingBudgetStateHolder:
             else:
                 state["end_count"] += 1
                 state["force_index"] = [0]
-            if state["end_count"] >= len(self.think_end_token_ids):
+            if state["end_count"] >= len(force_ids):
                 state.update(
                     {
                         "in_end": False,
@@ -532,17 +549,16 @@ class ThinkingBudgetStateHolder:
                     if len(force_index) == 0:
                         continue
                     end_count = state.get("end_count", 0)
+                    force_ids = self._force_ids(state)
                     for force_idx in force_index:
-                        if end_count < len(self.think_end_token_ids):
+                        if end_count < len(force_ids):
                             mask_idx = self.cu_num_tokens[seq_idx] + force_idx
                             if (
                                 mask_idx < self._mask_capacity
                                 and mask_idx < logits.shape[0]
                             ):
                                 active_indices_cpu.append(mask_idx)
-                                force_tokens_cpu.append(
-                                    self.think_end_token_ids[end_count]
-                                )
+                                force_tokens_cpu.append(force_ids[end_count])
                             if predict_bonus_token:
                                 if state["end_count"] > 0:
                                     state["bonus_token_forced"] = False

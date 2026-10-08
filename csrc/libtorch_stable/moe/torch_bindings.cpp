@@ -95,7 +95,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "int n_local_expert,"
       "int topk, Tensor! permuted_input, Tensor! "
       "expert_first_token_offset, Tensor! inv_permuted_idx, Tensor! "
-      "permuted_idx)->()");
+      "permuted_idx, bool skip_input_permute=False)->()");
 
   m.def(
       "moe_permute_with_scratch(Tensor input, Tensor topk_ids,"

@@ -93,6 +93,14 @@ void get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
     torch::stable::Tensor& problem_sizes2, const int64_t n, const int64_t k,
     const bool swap_ab);
 
+void get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets(
+    const torch::stable::Tensor& expert_first_token_offset,
+    torch::stable::Tensor& problem_sizes1,
+    torch::stable::Tensor& problem_sizes2,
+    torch::stable::Tensor& expert_offsets,
+    torch::stable::Tensor& blockscale_offsets, const int64_t n,
+    const int64_t k);
+
 void get_cutlass_batched_moe_mm_data(
     torch::stable::Tensor& expert_offsets,
     torch::stable::Tensor& problem_sizes1,
@@ -137,6 +145,15 @@ void scaled_fp4_experts_quant(
     torch::stable::Tensor const& input_global_scale,
     torch::stable::Tensor const& input_offset_by_experts,
     torch::stable::Tensor const& output_scale_offset_by_experts);
+
+void scaled_fp4_experts_quant_permuted(
+    torch::stable::Tensor& output, torch::stable::Tensor& output_scale,
+    torch::stable::Tensor const& input,
+    torch::stable::Tensor const& input_global_scale,
+    torch::stable::Tensor const& input_offset_by_experts,
+    torch::stable::Tensor const& output_scale_offset_by_experts,
+    torch::stable::Tensor const& permuted_idx,
+    torch::stable::Tensor& inv_permuted_idx, int64_t topk);
 
 void silu_and_mul_scaled_fp4_experts_quant(
     torch::stable::Tensor& output, torch::stable::Tensor& output_scale,
@@ -239,6 +256,35 @@ void silu_and_mul_per_block_quant(torch::stable::Tensor& out,
                                   int64_t group_size,
                                   std::optional<torch::stable::Tensor> scale_ub,
                                   bool is_scale_transposed);
+
+// Grouped fused-mul PolyNorm activation for the motif3 MoE (Standard
+// FusedMoE activation format, i.e. between GEMM1 and GEMM2).
+torch::stable::Tensor grouped_poly_norm_forward(
+    torch::stable::Tensor const& input, torch::stable::Tensor const& mul,
+    torch::stable::Tensor const& weight, torch::stable::Tensor const& bias,
+    torch::stable::Tensor const& topk_ids,
+    std::optional<torch::stable::Tensor> const& expert_map, int64_t top_k,
+    double eps, double hidden_clamp);
+
+// motif3 ModelOpt NVFP4 MoE: grouped PolyNorm straight to expert-aware
+// swizzled NVFP4 activations plus E4M3 scale factors for GEMM2.
+void grouped_poly_norm_nvfp4_quant(
+    torch::stable::Tensor& output, torch::stable::Tensor& output_scale,
+    torch::stable::Tensor const& input, torch::stable::Tensor const& mul,
+    torch::stable::Tensor const& weight, torch::stable::Tensor const& bias,
+    torch::stable::Tensor const& expert_offsets,
+    torch::stable::Tensor const& blockscale_offsets,
+    torch::stable::Tensor const& input_global_scale, double eps,
+    double hidden_clamp, double polynorm_output_scale);
+
+// motif3 DeepGEMM MoE: fused grouped PolyNorm + 1x128 FP8 requant.
+std::tuple<torch::stable::Tensor, torch::stable::Tensor>
+grouped_poly_norm_fp8_quant(torch::stable::Tensor const& gate_up,
+                            torch::stable::Tensor const& weight,
+                            torch::stable::Tensor const& bias,
+                            torch::stable::Tensor const& group_ids, double eps,
+                            double hidden_clamp, double polynorm_output_scale,
+                            bool use_ue8m0, bool packed_scale);
 
 // Positional encoding kernels (shared CUDA/ROCm)
 void rotary_embedding(torch::stable::Tensor& positions,

@@ -734,6 +734,22 @@ class SpeculativeConfig:
                 }
             )
 
+        if hf_config.model_type == "Motif" and getattr(
+            hf_config, "num_nextn_predict_layers", 0
+        ):
+            # Motif MTP draft model: route to "mtp" method (model_type "mtp" is in
+            # MTPModelTypes) and the MotifMTP class via architectures. num_hidden_layers
+            # is zeroed so the draft only builds the MTP predictor layer(s).
+            hf_config.model_type = "mtp"
+            n_predict = hf_config.num_nextn_predict_layers
+            hf_config.update(
+                {
+                    "num_hidden_layers": 0,
+                    "n_predict": n_predict,
+                    "architectures": ["MotifMTPModel"],
+                }
+            )
+
         if (arch := hf_config.architectures[0]) in (
             "MiMoV2ForCausalLM",
             "MiMoV2OmniForCausalLM",
@@ -1933,6 +1949,14 @@ class SpeculativeConfig:
             and self.draft_model_config is not None
             and getattr(self.draft_model_config.hf_config, "model_type", None)
             == "step3p5_mtp"
+        )
+
+    def use_motif_mtp(self) -> bool:
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and "MotifMTPModel"
+            in (self.draft_model_config.hf_config.architectures or [])
         )
 
     def use_eagle(self) -> bool:

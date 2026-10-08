@@ -139,14 +139,29 @@ void moe_permute_impl(
     const std::optional<torch::stable::Tensor>& maybe_sort_workspace,
     const std::optional<torch::stable::Tensor>& maybe_permuted_experts_id,
     const std::optional<torch::stable::Tensor>& maybe_sorted_row_idx,
-    const std::optional<torch::stable::Tensor>& maybe_topk_ids_for_sort) {
+    const std::optional<torch::stable::Tensor>& maybe_topk_ids_for_sort,
+    bool skip_input_permute = false) {
   const torch::stable::accelerator::DeviceGuard device_guard(
       input.get_device_index());
+  if (skip_input_permute && token_expert_indices.numel() == 0) {
+    const int* expert_map_ptr =
+        expert_map.has_value() ? get_ptr<int>(expert_map.value()) : nullptr;
+    stableMapOnlyExpertSortLauncher(
+        get_ptr<int>(topk_ids), expert_map_ptr, get_ptr<int>(permuted_idx),
+        get_ptr<int64_t>(expert_first_token_offset), topk_ids.size(0), n_expert,
+        n_local_expert, topk,
+        get_current_cuda_stream(input.get_device_index()));
+    return;
+  }
   auto sorted_row_idx = moe_sort_routing(
       topk_ids, token_expert_indices, expert_map, n_expert, n_local_expert,
       topk, expert_first_token_offset, inv_permuted_idx, maybe_sort_workspace,
       maybe_permuted_experts_id, maybe_sorted_row_idx, maybe_topk_ids_for_sort,
       false);
+  if (skip_input_permute) {
+    torch::stable::copy_(permuted_idx, sorted_row_idx);
+    return;
+  }
   auto stream = get_current_cuda_stream(input.get_device_index());
   auto n_token = input.size(0);
   auto n_hidden = input.size(1);
@@ -173,11 +188,13 @@ void moe_permute(
     torch::stable::Tensor& permuted_input,  // [permuted_size, hidden]
     torch::stable::Tensor& expert_first_token_offset,  // [n_local_expert + 1]
     torch::stable::Tensor& inv_permuted_idx,           // [n_token, topk]
-    torch::stable::Tensor& permuted_idx) {             // [permute_size]
+    torch::stable::Tensor& permuted_idx,               // [permute_size]
+    bool skip_input_permute) {
   moe_permute_impl(input, topk_ids, token_expert_indices, expert_map, n_expert,
                    n_local_expert, topk, permuted_input,
                    expert_first_token_offset, inv_permuted_idx, permuted_idx,
-                   std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+                   std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                   skip_input_permute);
 }
 
 void moe_permute_with_scratch(
@@ -330,7 +347,7 @@ void moe_permute(const torch::stable::Tensor& input,
                  torch::stable::Tensor& permuted_input,
                  torch::stable::Tensor& expert_first_token_offset,
                  torch::stable::Tensor& inv_permuted_idx,
-                 torch::stable::Tensor& permuted_idx) {
+                 torch::stable::Tensor& permuted_idx, bool skip_input_permute) {
   STD_TORCH_CHECK(false, "moe_permute is not supported on CUDA < 12.0");
 }
 

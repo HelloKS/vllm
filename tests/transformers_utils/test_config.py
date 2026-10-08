@@ -27,6 +27,51 @@ from vllm.transformers_utils.config import (
 from vllm.transformers_utils.configs.mistral import adapt_config_dict
 
 
+def test_motif_config_loads_without_remote_code(tmp_path):
+    """Keep the checkpoint's hybrid-attention dimensions and YaRN parameters."""
+    from vllm.config.speculative import SpeculativeConfig
+    from vllm.transformers_utils.configs.motif import MotifConfig
+
+    rope_scaling = {
+        "rope_type": "yarn",
+        "factor": 64.0,
+        "original_max_position_embeddings": 4096,
+    }
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "Motif",
+                "architectures": ["MotifForCausalLM"],
+                "head_dim": 192,
+                "qk_rope_head_dim": 64,
+                "v_head_dim": 128,
+                "kv_lora_rank": 512,
+                "num_attention_heads": 80,
+                "num_experts": 384,
+                "experts_top_k": 8,
+                "use_sliding_window": True,
+                "sliding_window": 128,
+                "rope_scaling": rope_scaling,
+                "max_position_embeddings": 262144,
+                "num_nextn_predict_layers": 1,
+            }
+        )
+    )
+    _, config = config_module.HFConfigParser().parse(tmp_path, trust_remote_code=False)
+    assert isinstance(config, MotifConfig)
+    assert (
+        config.qk_nope_head_dim,
+        config.qk_rope_head_dim,
+        config.v_head_dim,
+        config.kv_lora_rank,
+    ) == (128, 64, 128, 512)
+    assert config.sliding_window == 128
+    assert config.rope_scaling.items() >= rope_scaling.items()
+    draft = SpeculativeConfig.hf_config_override(config)
+    assert draft.architectures == ["MotifMTPModel"]
+    assert draft.n_predict == 1
+
+
 @pytest.mark.parametrize("layout", ["mixed", "flat"])
 def test_gemma4_dspark_rope_config_preserves_parameters(tmp_path, layout):
     """Remove redundant shared entries while preserving per-layer and flat RoPE."""

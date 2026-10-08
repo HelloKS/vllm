@@ -133,6 +133,7 @@ class MHCPreOp(CustomOp):
         n_splits: int = 1,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        motif_sinkhorn: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
@@ -147,6 +148,7 @@ class MHCPreOp(CustomOp):
             n_splits,
             norm_weight,
             norm_eps,
+            motif_sinkhorn,
         )
 
     def forward_hip(
@@ -163,12 +165,16 @@ class MHCPreOp(CustomOp):
         n_splits: int = 1,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        motif_sinkhorn: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if _aiter_mhc_supported(
             residual,
             norm_weight,
             supports_norm=HAS_AITER_MHC_PRE_NORM,
         ):
+            assert not motif_sinkhorn, (
+                "motif_sinkhorn is not implemented in the aiter mhc_pre kernel"
+            )
             return torch.ops.vllm.mhc_pre_aiter(
                 residual,
                 fn,
@@ -197,6 +203,7 @@ class MHCPreOp(CustomOp):
                 n_splits,
                 norm_weight,
                 norm_eps,
+                motif_sinkhorn,
             )
         else:
             post_mix, comb_mix, layer_input = self.forward_native(
@@ -212,6 +219,7 @@ class MHCPreOp(CustomOp):
                 n_splits,
                 norm_weight,
                 norm_eps,
+                motif_sinkhorn,
             )
             return (
                 post_mix,
@@ -233,6 +241,7 @@ class MHCPreOp(CustomOp):
         n_splits: int = 1,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        motif_sinkhorn: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return mhc_kernels.mhc_pre_torch(
             residual,
@@ -244,6 +253,7 @@ class MHCPreOp(CustomOp):
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
+            motif_sinkhorn=motif_sinkhorn,
         )
 
     def forward_xpu(
@@ -260,7 +270,21 @@ class MHCPreOp(CustomOp):
         n_splits: int = 1,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        motif_sinkhorn: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if motif_sinkhorn:
+            return self.forward_native(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                motif_sinkhorn=motif_sinkhorn,
+            )
         return torch.ops._xpu_C.mhc_pre(
             residual,
             fn,
@@ -287,7 +311,21 @@ class MHCPreOp(CustomOp):
         n_splits: int = 1,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        motif_sinkhorn: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if motif_sinkhorn:
+            return self.forward_native(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                motif_sinkhorn=motif_sinkhorn,
+            )
         return mhc_kernels.mhc_pre_cpu(
             residual,
             fn,
