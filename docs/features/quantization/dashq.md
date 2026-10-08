@@ -34,6 +34,21 @@ should be increased only after the accuracy and memory gates pass. A compiled
 run and an eager run exercise different compiler paths; successful eager
 inference alone does not verify the Inductor regression.
 
+## Dynamic token dimension fix (2026-10-09)
+
+A subsequent default-compiler run specialized the dynamic token dimension to
+32768 during AOT guard generation. The serving path now uses opaque
+`vllm::dashq_linear` and `vllm::dashq_moe` custom ops with symbolic fake output
+shapes. Batch-size dispatch and Triton constexprs stay inside the runtime op;
+vLLM's dynamic-shape constraints are retained. Raw Triton entry points are still
+tested separately for the earlier explicit-constexpr fix.
+
+Two CPU strict-export regression tests pass for a 32768-token example and retain
+variable output shapes at 1, 2, 31, 32, 33, 128 and 32768 tokens. These validate
+operator registration and symbolic shapes, not CUDA execution. GPU tests also
+cover strict dynamic Inductor execution and CUDA Graph replay through the new
+ops. Full GB10 TP=2 validation remains pending.
+
 ## Build and pin the environment
 
 Use the same source checkout and absolute environment path on both nodes, CUDA
@@ -68,6 +83,7 @@ files. Build before loading the 210GB model. GB10's CPU/GPU memory is shared.
 uv run --no-project .venv/bin/python -m pytest \
   tests/model_executor/test_dashq_format.py \
   tests/model_executor/test_dashq_validation.py \
+  tests/model_executor/test_dashq_compile.py \
   tests/kernels/quantization/test_dashq.py -v
 uv run --no-project .venv/bin/python -m examples.quantization.dashq.make_tiny_checkpoint \
   /data/dashq-tiny

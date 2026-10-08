@@ -7,9 +7,15 @@ import torch
 
 pytest.importorskip("triton")
 
-from vllm.model_executor.layers.quantization.utils.dashq_triton import (
+from vllm.model_executor.layers.quantization.utils.dashq_ops import (
     dashq_linear,
     dashq_moe,
+)
+from vllm.model_executor.layers.quantization.utils.dashq_triton import (
+    dashq_linear as triton_linear,
+)
+from vllm.model_executor.layers.quantization.utils.dashq_triton import (
+    dashq_moe as triton_moe,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -51,7 +57,7 @@ def test_linear_inductor_compilation(m):
     """Inductor must receive tile constexprs on GEMV and both GEMM paths."""
     q, s, z, ref = weights(130, 96)
     x = torch.randn((m, 96), device="cuda", dtype=torch.bfloat16)
-    compiled = torch.compile(dashq_linear, backend="inductor", fullgraph=True)
+    compiled = torch.compile(triton_linear, backend="inductor", fullgraph=True)
     expected = (x.float() @ ref).bfloat16() if m == 1 else x @ ref.bfloat16()
     assert_error(compiled(x, q, s, z), expected)
 
@@ -98,9 +104,41 @@ def test_moe_inductor_compilation(m):
     x = torch.randn((m, 64), device="cuda", dtype=torch.bfloat16)
     ids = torch.rand((m, 4), device="cuda").argsort(-1)[:, :2].int()
     route = torch.softmax(torch.randn((m, 2), device="cuda"), -1)
-    compiled = torch.compile(dashq_moe, backend="inductor", fullgraph=True)
+    compiled = torch.compile(triton_moe, backend="inductor", fullgraph=True)
     actual = compiled(x, q1, s1, z1, q2, s2, z2, route, ids)
     assert_error(actual, reference_moe(x, w1, w2, route, ids))
+
+
+def test_linear_dynamic_inductor_compilation():
+    """A strict dynamic warmup at 32768 tokens must also serve small batches."""
+    q, s, z, ref = weights(32, 64)
+    compiled = torch.compile(
+        dashq_linear, backend="inductor", fullgraph=True, dynamic=True
+    )
+    for m in (32768, 2, 31, 32, 33, 128, 1):
+        x = torch.randn((m, 64), device="cuda", dtype=torch.bfloat16)
+        if m == 32768:
+            torch._dynamo.mark_dynamic(x, 0, min=1, max=32768)
+        expected = (x.float() @ ref).bfloat16() if m == 1 else x @ ref.bfloat16()
+        assert_error(compiled(x, q, s, z), expected)
+
+
+def test_moe_dynamic_inductor_compilation():
+    """Keep both dispatch branches opaque while routes and token counts change."""
+    q1, s1, z1, w1 = weights(128, 64, 4)
+    q2, s2, z2, w2 = weights(64, 128, 4)
+    compiled = torch.compile(
+        dashq_moe, backend="inductor", fullgraph=True, dynamic=True
+    )
+    for m in (128, 2, 33, 1):
+        x = torch.randn((m, 64), device="cuda", dtype=torch.bfloat16)
+        ids = torch.rand((m, 4), device="cuda").argsort(-1)[:, :2].int()
+        route = torch.softmax(torch.randn((m, 2), device="cuda"), -1)
+        if m == 128:
+            for tensor in (x, ids, route):
+                torch._dynamo.mark_dynamic(tensor, 0, min=1, max=32768)
+        actual = compiled(x, q1, s1, z1, q2, s2, z2, route, ids)
+        assert_error(actual, reference_moe(x, w1, w2, route, ids))
 
 
 @pytest.mark.parametrize("m", [1, 2])

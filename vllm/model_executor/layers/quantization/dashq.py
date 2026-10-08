@@ -20,6 +20,10 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.dashq_ops import (
+    dashq_linear,
+    dashq_moe,
+)
 from vllm.transformers_utils.dashq import tp_slices, validate_metadata
 
 
@@ -122,10 +126,6 @@ class DashQLinearMethod(LinearMethodBase):
             raise ValueError("DASH-Q output partitions do not match layer")
 
     def apply(self, layer, x, bias=None):
-        from vllm.model_executor.layers.quantization.utils.dashq_triton import (
-            dashq_linear,
-        )
-
         return dashq_linear(
             x, layer.dashq_qweight, layer.dashq_scale, layer.dashq_zero, bias
         )
@@ -187,10 +187,6 @@ class DashQMoEMethod(FusedMoEMethodBase):
         shared_experts=None,
         shared_experts_input=None,
     ):
-        from vllm.model_executor.layers.quantization.utils.dashq_triton import (
-            dashq_moe,
-        )
-
         # The existing runner owns routing, shared experts, latent transforms,
         # routed scaling and TP reductions. This returns local routed output only.
         return dashq_moe(
