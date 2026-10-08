@@ -36,6 +36,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.motif_kv_cache import MotifKVCacheSpecMixin
 from vllm.model_executor.models.motif_weight_utils import load_motif_kv_b_shard
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.motif import MotifConfig
@@ -60,6 +61,14 @@ from .utils import (
 # path with motif_sinkhorn=1 (its training sinkhorn convention); the eager
 # reference paths below are pure torch.
 # ---------------------------------------------------------------------------
+
+
+class MotifAttention(MotifKVCacheSpecMixin, Attention):
+    pass
+
+
+class MotifMLAAttention(MotifKVCacheSpecMixin, MLAAttention):
+    pass
 
 
 def _stat(tag: str, x: torch.Tensor) -> None:
@@ -649,7 +658,7 @@ class MotifGDLAttention(nn.Module):
         # token. SWA / non-hybrid layers keep the standard GQA path through the
         # diff-KV flash backend.
         if self.is_mla_layer:
-            self.mla_attn = MLAAttention(
+            self.mla_attn = MotifMLAAttention(
                 num_heads=self.num_local_heads,
                 scale=self.scaling,
                 qk_nope_head_dim=self.qk_nope_head_dim,
@@ -692,7 +701,7 @@ class MotifGDLAttention(nn.Module):
             else:
                 attn_backend = None
 
-            self.attn = Attention(
+            self.attn = MotifAttention(
                 self.num_local_heads,
                 self.head_dim,
                 self.scaling,

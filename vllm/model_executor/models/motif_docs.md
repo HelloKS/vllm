@@ -156,6 +156,29 @@ then together. Check mHC and PolyNorm against references and evaluate output
 quality against the baseline. FP8/INT4 kernel tests are only a prerequisite for
 full-model accuracy evaluation, not a replacement for it.
 
+### Hybrid KV cache allocation
+
+Motif's MLA latent cache and expanded sliding-window K/V cache have different
+page sizes. Motif's attention classes use a model-specific `get_kv_cache_spec`
+hook to round SWA pages up to a common MLA page multiple. It reads only Motif
+layers' resolved specs after loading; other models and the core allocator are
+unchanged. The existing allocator grows MLA's contiguous token blocks by an
+integer factor; SWA keeps its token block size with page padding.
+SWA groups can then release blocks outside the window instead of retaining the
+entire context through the full-allocation fallback.
+
+For TP=2 and 128-token input blocks, BF16 MLA uses 640-token blocks and SWA pages
+have 12.5% padding. With FP8 MLA and BF16 SWA, MLA uses 1152-token blocks and SWA
+padding is 1.25%. Prefix hits align to these larger MLA blocks. Use
+`--kv-cache-dtype fp8 --kv-cache-dtype-skip-layers sliding_window` for the mixed
+case; this does not enable FP8 in the Motif DiffKV backend.
+
+CPU regression tests cover grouping, strided allocation, chunked prefill,
+window eviction, prefix reuse and subsequent decode allocation. The padded
+DiffKV cache write/read and CUDA graph cases are in
+`tests/kernels/attention/test_motif_attention.py`; these and full-model output
+quality still require validation on the target GPU build.
+
 ## Overview
 
 Motif is a decoder-only language model combining three key architectural innovations:

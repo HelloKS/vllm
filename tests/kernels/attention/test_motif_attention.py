@@ -9,15 +9,19 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @pytest.mark.parametrize(
-    "paged,causal,window",
+    "paged,causal,window,page_padding",
     [
-        (False, False, -1),
-        (False, True, -1),
-        (True, True, 128),
+        (False, False, -1, 0),
+        (False, True, -1, 0),
+        (True, True, 128, 0),
+        (True, True, 128, 4096),  # FP8 MLA + BF16 SWA, TP=2.
+        (True, True, 128, 40960),  # BF16 MLA + BF16 SWA, TP=2.
     ],
 )
 @pytest.mark.parametrize("query_len,kv_len", [(1, 129), (17, 257), (33, 33)])
-def test_motif_diffkv_matches_reference(paged, causal, window, query_len, kv_len):
+def test_motif_diffkv_matches_reference(
+    paged, causal, window, page_padding, query_len, kv_len
+):
     from vllm.v1.attention.ops.motif_attention import motif_attention
 
     torch.manual_seed(9)
@@ -29,14 +33,26 @@ def test_motif_diffkv_matches_reference(paged, causal, window, query_len, kv_len
     ks = torch.tensor([0, kv_len], device=device, dtype=torch.int32)
     extra = {}
     if paged:
+        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+            triton_reshape_and_cache_flash_diffkv,
+        )
+
         pages = (kv_len + 127) // 128
         # Reverse physical pages to catch accidental contiguous-cache reads.
         table = torch.arange(pages - 1, -1, -1, device=device, dtype=torch.int32)[None]
-        kc = torch.zeros(pages, 128, 8, 192, device=device, dtype=q.dtype)
-        vc = torch.zeros(pages, 128, 8, 128, device=device, dtype=q.dtype)
-        for i in range(kv_len):
-            kc[table[0, i // 128], i % 128] = k[i]
-            vc[table[0, i // 128], i % 128] = v[i]
+        page_elements = 128 * 8 * 320
+        storage = torch.zeros(
+            pages, page_elements + page_padding, device=device, dtype=q.dtype
+        )
+        cache = storage.as_strided(
+            (pages, 128, 8, 320), (storage.stride(0), 8 * 320, 320, 1)
+        )
+        positions = torch.arange(kv_len, device=device, dtype=torch.int64)
+        slots = table[0, positions // 128].long() * 128 + positions % 128
+        scale = torch.ones((), device=device, dtype=torch.float32)
+        triton_reshape_and_cache_flash_diffkv(k, v, cache, slots, "auto", scale, scale)
+        kc, vc = cache.split([192, 128], dim=-1)
+        assert torch.count_nonzero(storage[:, page_elements:]) == 0
         extra = dict(block_table=table, seq_lens=ks[1:])
     else:
         kc, vc = k, v
