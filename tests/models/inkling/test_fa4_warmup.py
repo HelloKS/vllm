@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import vllm.models.inkling.nvidia.ops.fa4_rel_attention as fa4_rel_attention
@@ -13,6 +14,7 @@ from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
     bucket_max_seqlen_q,
     inkling_fa4_num_splits,
 )
+from vllm.platforms.interface import DeviceCapability
 
 
 def _vllm_config_from_reference_config(config: SimpleNamespace) -> SimpleNamespace:
@@ -58,13 +60,22 @@ def test_bucket_max_seqlen_q():
     ]
 
 
-def test_warmup_keys_fp8_kv_dtype(monkeypatch):
+@pytest.mark.parametrize("major,minor", [(10, 0), (10, 3), (12, 0), (12, 1)])
+def test_warmup_keys_fp8_kv_dtype(monkeypatch, major, minor):
     # fp8 caches are allocated as uint8; warmup must compile against the
     # viewed e4m3 dtype, never uint8.
     monkeypatch.setattr(
         fa4_rel_attention,
         "get_tensor_model_parallel_world_size",
         lambda: 1,
+    )
+    monkeypatch.setattr(
+        fa4_rel_attention.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(major=major, minor=minor),
+    )
+    monkeypatch.setattr(
+        fa4_rel_attention.current_platform, "fp8_dtype", lambda: torch.float8_e4m3fn
     )
     config = SimpleNamespace(
         num_heads=16,
@@ -86,6 +97,8 @@ def test_warmup_keys_fp8_kv_dtype(monkeypatch):
     assert keys
     assert all(key.kv_dtype == torch.float8_e4m3fn for key in keys)
     assert all(key.dtype == torch.bfloat16 for key in keys)
+    if major == 12:
+        assert all(key.num_splits == 1 and key.num_warps_bucket is None for key in keys)
 
 
 def test_warmup_enumerates_every_runtime_compile_class(monkeypatch):

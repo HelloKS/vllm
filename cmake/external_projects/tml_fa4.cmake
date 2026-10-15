@@ -13,8 +13,9 @@ if(TML_FA4_SRC_DIR)
 else()
   FetchContent_Declare(
     tml_fa4
-    GIT_REPOSITORY https://github.com/vllm-project/tml-fa4.git
-    GIT_TAG 75765e76a9c2c012c1f6ecd64577eb646eb4d303
+    GIT_REPOSITORY https://github.com/HelloKS/tml-fa4.git
+    # feat/sm120-sm121-native-fp8: native FP8 MMA and relative bias on SM12x.
+    GIT_TAG 31062b9a7b3a896e13b6949f12e9a405c7bb2651
     GIT_PROGRESS TRUE
     CONFIGURE_COMMAND ""
     BUILD_COMMAND "")

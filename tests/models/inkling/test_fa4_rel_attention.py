@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness and gating tests for the Inkling FA4 relative-attention kernels.
 
-Covers the cute score-mod and sheared tml-fa4 paths, bf16 and fp8 KV
+Covers the cute score-mod and tml-fa4 relative-bias paths, bf16 and fp8 KV
 (numerics, platform gates, warmup and cache-spec wiring), checking
 ``_INKLING_FA4_REL_ATTENTION_KERNEL`` against a pure-PyTorch reference
 that implements the relative bias exactly as documented in the Inkling
@@ -26,7 +26,7 @@ from vllm.models.inkling.nvidia.attention import (
 )
 from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
     _INKLING_FA4_REL_ATTENTION_KERNEL,
-    _use_sheared_bias,
+    _use_tml_fa4,
     inkling_fa4_num_splits,
 )
 from vllm.platforms import current_platform
@@ -77,11 +77,12 @@ def test_split_packed_kv_cache():
     torch.testing.assert_close(value_cache, attention.kv_cache[..., 8:].transpose(1, 2))
 
 
-def test_num_splits_hopper_is_unsplit(monkeypatch):
+@pytest.mark.parametrize("major,minor", [(9, 0), (12, 0), (12, 1)])
+def test_num_splits_unsupported_architectures_are_unsplit(monkeypatch, major, minor):
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda: DeviceCapability(major=9, minor=0),
+        lambda: DeviceCapability(major=major, minor=minor),
     )
     assert (
         inkling_fa4_num_splits(
@@ -97,20 +98,20 @@ def test_num_splits_hopper_is_unsplit(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("major", "expected"),
-    [(9, False), (10, True), (11, True), (12, False)],
+    ("major", "minor", "expected"),
+    [(9, 0, False), (10, 0, True), (11, 0, True), (12, 0, True), (12, 1, True)],
 )
-def test_sheared_bias_architecture_selection(monkeypatch, major, expected):
+def test_tml_fa4_architecture_selection(monkeypatch, major, minor, expected):
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda: DeviceCapability(major=major, minor=0),
+        lambda: DeviceCapability(major=major, minor=minor),
     )
-    _use_sheared_bias.cache_clear()
+    _use_tml_fa4.cache_clear()
     try:
-        assert _use_sheared_bias() is expected
+        assert _use_tml_fa4() is expected
     finally:
-        _use_sheared_bias.cache_clear()
+        _use_tml_fa4.cache_clear()
 
 
 @pytest.fixture
@@ -374,7 +375,7 @@ def _run_case(
 @torch.inference_mode()
 def test_score_mod_relative_attention(monkeypatch):
     module = importlib.import_module("vllm.models.inkling.nvidia.ops.fa4_rel_attention")
-    monkeypatch.setattr(module, "_use_sheared_bias", lambda: False)
+    monkeypatch.setattr(module, "_use_tml_fa4", lambda: False)
     _run_case(
         [(64, 64), (1, 80)],
         num_heads=4,
@@ -480,26 +481,28 @@ def test_decode(seq_lens, num_heads, rel_extent):
     _run_case(seq_lens, num_heads[0], num_heads[1], rel_extent, window_left=None)
 
 
-requires_sm100 = pytest.mark.skipif(
-    _cap is None or _cap.major != 10,
-    reason="Inkling fp8 KV requires an SM100-family GPU",
+requires_fp8_gpu = pytest.mark.skipif(
+    _cap is None
+    or (_cap.major, _cap.minor) not in ((10, 0), (10, 3), (12, 0), (12, 1)),
+    reason="Inkling fp8 KV requires an SM100/SM103/SM120/SM121 GPU",
 )
 
-# Both fp8 kernel paths are supported on SM100: the tml-fa4 sheared-bias
-# default and the cute score-mod path.
-FP8_PATHS = ["sheared", "scoremod"]
+# SM12x uses tml-fa4 only; SM100/SM103 also support standard cute score-mod.
+FP8_PATHS = ["tml", "scoremod"]
 
 
 def _force_fp8_path(monkeypatch, fp8_path):
     if fp8_path == "scoremod":
+        if _cap is not None and _cap.major == 12:
+            pytest.skip("SM120/SM121 fp8 relative attention requires tml-fa4")
         module = importlib.import_module(
             "vllm.models.inkling.nvidia.ops.fa4_rel_attention"
         )
-        monkeypatch.setattr(module, "_use_sheared_bias", lambda: False)
+        monkeypatch.setattr(module, "_use_tml_fa4", lambda: False)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
-@requires_sm100
+@requires_fp8_gpu
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize(
     "seq_lens",
@@ -530,7 +533,7 @@ def test_fp8_kv_full_attention(
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
-@requires_sm100
+@requires_fp8_gpu
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("fp8_scales", FP8_SCALES)
 @pytest.mark.parametrize("fp8_path", FP8_PATHS)
@@ -568,11 +571,12 @@ def test_get_kv_cache_spec_fp8_sets_quant_mode():
         assert spec.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
 
 
-def test_fp8_gate_accepts_e4m3_on_sm100(monkeypatch):
+@pytest.mark.parametrize("major,minor", [(10, 0), (10, 3), (12, 0), (12, 1)])
+def test_fp8_gate_accepts_e4m3_on_supported_gpus(monkeypatch, major, minor):
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda: DeviceCapability(major=10, minor=0),
+        lambda: DeviceCapability(major=major, minor=minor),
     )
     InklingAttention._validate_quantized_kv_cache_dtype("fp8")
     InklingAttention._validate_quantized_kv_cache_dtype("fp8_e4m3")
@@ -600,12 +604,12 @@ def test_amd_gate_rejects_quantized_kv_cache_dtype():
             amd_attention.InklingAttention._validate_kv_cache_dtype(dtype)
 
 
-@pytest.mark.parametrize("major", [9, 12])
-def test_fp8_gate_rejects_non_sm100(monkeypatch, major):
+@pytest.mark.parametrize("major,minor", [(9, 0), (10, 1), (11, 0), (12, 2)])
+def test_fp8_gate_rejects_unsupported_gpus(monkeypatch, major, minor):
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",
-        lambda: DeviceCapability(major=major, minor=0),
+        lambda: DeviceCapability(major=major, minor=minor),
     )
     with pytest.raises(NotImplementedError, match="SM100"):
         InklingAttention._validate_quantized_kv_cache_dtype("fp8")

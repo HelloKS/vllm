@@ -208,12 +208,15 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                 f"('fp8'/'fp8_e4m3'), got {kv_cache_dtype!r}"
             )
         capability = current_platform.get_device_capability()
-        if capability is None or capability.major != 10:
-            # fp8 kernels exist only for the SM100 family; Hopper and
-            # SM12x have no fp8 path in either FA4 backend.
+        if capability is None or (capability.major, capability.minor) not in (
+            (10, 0),
+            (10, 3),
+            (12, 0),
+            (12, 1),
+        ):
             cap_str = capability.as_version_str() if capability is not None else None
             raise NotImplementedError(
-                "Inkling fp8 KV cache requires an SM100-family GPU, got "
+                "Inkling fp8 KV cache requires an SM100/SM103/SM120/SM121 GPU, got "
                 f"compute capability {cap_str}"
             )
 

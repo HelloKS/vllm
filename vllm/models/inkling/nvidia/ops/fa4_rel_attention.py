@@ -32,9 +32,9 @@ def bucket_max_seqlen_q(max_seqlen_q: int) -> int:
 
 
 @cache
-def _use_sheared_bias() -> bool:
+def _use_tml_fa4() -> bool:
     capability = current_platform.get_device_capability()
-    return capability is not None and capability.major in (10, 11)
+    return capability is not None and capability.major in (10, 11, 12)
 
 
 @cache
@@ -83,7 +83,8 @@ def inkling_fa4_num_splits(
 ) -> int:
     """Return the split-KV cap for Inkling relative attention."""
     capability = current_platform.get_device_capability()
-    if capability is not None and capability.major == 9:
+    # Hopper and tml-fa4's SM12x kernels do not support split-KV.
+    if capability is not None and capability.major in (9, 12):
         return 1
     if is_local:
         return 1
@@ -167,11 +168,9 @@ class InklingFA4RelAttentionKernel(
         ``(num_tokens, num_heads, rel_extent)``.
 
         Hopper uses standard FA4's score-mod gather. Blackwell uses tml-fa4's
-        sheared relative-bias layout for both bf16 and fp8 (plain-fp8
-        support lands in the vendored tml-fa4 via the companion kernel
-        PR, adapted from closed tml-fa4 PR #1); the cute score-mod path
-        also supports fp8 on SM100 and remains the cross-check and
-        non-sheared fallback.
+        ``rel_bias`` interface for both bf16 and fp8: SM100/SM103 use sheared
+        bias, while SM120/SM121 gather unsheared bias in the kernel. The
+        standard cute score-mod path also supports fp8 on SM100/SM103.
 
         ``q_descale``/``k_descale``/``v_descale`` are per-tensor scalar
         descales, required for fp8 and rejected otherwise. Neither vendored
@@ -197,7 +196,7 @@ class InklingFA4RelAttentionKernel(
 
         rel_logits = rel_logits.contiguous()
         flash_attn_varlen_func: Callable[..., Any]
-        if _use_sheared_bias():
+        if _use_tml_fa4():
             from vllm.third_party.tml_fa4 import (
                 flash_attn_varlen_func as tml_flash_attn_varlen_func,
             )
